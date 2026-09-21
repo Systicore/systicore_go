@@ -9,6 +9,7 @@ blacklab, bliss, biharvideke, mymosaiq, … — whatever HTTP stack they run.
 systicore_go/                  module github.com/Systicore/systicore_go       ← core: stdlib + zerolog only
 ├── logging/                   New, Options, context helpers, Middleware (net/http)
 ├── logging/grpclog/           gRPC interceptors (compiled only when imported)
+├── report/                    client of the systicore_reports backend (error reports from services)
 ├── fiberv3/                   module github.com/Systicore/systicore_go/fiberv3  ← Fiber v3 adapters
 ├── fiberv2/                   module github.com/Systicore/systicore_go/fiberv2  ← Fiber v2 adapters
 └── go.work                    local dev only
@@ -79,3 +80,41 @@ Every adapter does the same three things: request-scoped logger with
 caller or minted and echoed back, so one id follows a request across
 services. `logging.Enrich(ctx, fn)` adds fields in place (`user_id` after
 auth). No package-level `Info()`/`Fatal()`; tests pass `zerolog.Nop()`.
+
+## report
+
+Error reports from a Go service into the same pipeline the apps use
+(reports backend → dedup, severity escalation, triage, projects
+automation → task / GitHub issue / push):
+
+```go
+rep, err := report.New(report.Options{
+    BaseURL: cfg.Reports.URL,            // https://reports.systicore.hu
+    Source:  cfg.App.Name,               // the project's report source, e.g. blacklab_backend
+    Device:  report.ServerDevice(version),
+    Tokens:  serviceTokens,              // client_credentials token source; nil in dev
+    Logger:  root,                       // WITHOUT the hook, see below
+})
+defer rep.Close(ctx)
+
+root = root.Hook(rep.Hook())            // every Error/Fatal/Panic log line → a report
+
+rep.CaptureError(ctx, err, "eventpush.deliver", report.SeverityCritical) // rich: stable code, stack, request id
+```
+
+- `Capture` / `CaptureError` never block: bounded queue, one sender with
+  retry (transient 5xx/429/401 retried, 400/404/413/422 dropped as
+  `ErrRejected`), drops counted (`Dropped()`) and logged once a minute.
+  `Close` flushes the queue with a deadline.
+- `ErrorCode(err)`: a `Coder`'s own code, else the outermost typed error
+  (`*fs.PathError`), else `"error"` — the dedup identity is code + message
+  + action per host, so keep codes stable and put detail in the trace.
+- `ServerDevice(version)`: brand `server`, model = hostname, GOOS/GOARCH +
+  Go version, app version from your ldflags.
+
+**Server side, required before this works:** the reports backend's
+`POST /api/v1/report` today accepts user JWTs only (its middleware parses
+`sub` as a numeric user id); a client_credentials token (`sub = client:<id>`)
+gets 401. Reports v2 must accept service tokens on the ingest route
+(user id absent, source from the body) — until then use a user token
+(`report.StaticToken`) or leave `Tokens` nil in development.
