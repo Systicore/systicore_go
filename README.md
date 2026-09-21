@@ -1,23 +1,60 @@
 # systicore_go
 
-Shared Go packages for the SYSTICORE backends. Each package is small,
-transport-agnostic where it can be, and takes options instead of a
-service's config struct.
+Shared Go packages for every Systicore backend — the systicore_* services,
+blacklab, bliss, biharvideke, mymosaiq, … — whatever HTTP stack they run.
 
-```bash
-go get github.com/Systicore/systicore_go@latest
+## Layout: one framework-free core, adapters at the edge
+
+```
+systicore_go/                  module github.com/Systicore/systicore_go       ← core: stdlib + zerolog only
+├── logging/                   New, Options, context helpers, Middleware (net/http)
+├── logging/grpclog/           gRPC interceptors (compiled only when imported)
+├── fiberv3/                   module github.com/Systicore/systicore_go/fiberv3  ← Fiber v3 adapters
+├── fiberv2/                   module github.com/Systicore/systicore_go/fiberv2  ← Fiber v2 adapters
+└── go.work                    local dev only
 ```
 
-| Package | What |
+Rules that keep it usable everywhere:
+
+1. **The core imports no web framework.** Everything transport-independent
+   lives in the root module and speaks `context.Context`; the `net/http`
+   adapters are plain `func(http.Handler) http.Handler`, which is why chi,
+   gorilla/mux and a bare `ServeMux` share them with no chi dependency.
+2. **Fiber is a separate module per major.** Fiber is fasthttp-based, so it
+   needs its own handlers, and v2 and v3 pin different versions of the
+   unversioned `github.com/valyala/fasthttp` path. Keeping `fiberv2/` and
+   `fiberv3/` as modules of their own means a chi service never sees
+   fasthttp in its graph and a v2 service is never forced onto v3's pin.
+3. **Heavy optional deps go in sub-packages.** `logging/grpclog` is a
+   package, not a module: a service that never imports it never compiles
+   gRPC, while services that do get one version of everything.
+4. **Options, not configs.** Packages take small option structs; no
+   service's `config` package is imported here.
+5. **The domain layer never imports this module.** It gets the logger from
+   `zerolog.Ctx(ctx)`, the request id from `logging.RequestID(ctx)` if it
+   must — the same call under net/http, Fiber v2, Fiber v3 and gRPC.
+
+## Versioning
+
+Three modules, three tag series, all semver:
+
+| Module | Tag |
 |---|---|
-| `logging` | zerolog bootstrap (level, console/file with rotation) + request-scoped logger for chi and gRPC, request-id propagation |
+| root | `v0.1.0` |
+| fiberv3 | `fiberv3/v0.1.0` |
+| fiberv2 | `fiberv2/v0.1.0` |
+
+Release order: tag the root, point the adapters' `require` at that tag
+(and remove the `replace ../` they carry while unpublished), tag the
+adapters. Consumers:
+
+```bash
+go get github.com/Systicore/systicore_go@v0.1.0
+go get github.com/Systicore/systicore_go/fiberv3@v0.1.0   # Fiber v3 services
+go get github.com/Systicore/systicore_go/fiberv2@v0.1.0   # Fiber v2 services
+```
 
 ## logging
-
-The domain layer never imports `logging`: it calls `zerolog.Ctx(ctx)` and
-gets the request-scoped logger the transport put there (request id,
-method/rpc, client ip, and whatever `logging.Enrich` added later, e.g.
-`user_id`), or the root logger outside a request.
 
 ```go
 root, closeLog, err := logging.New(logging.Options{
@@ -25,23 +62,20 @@ root, closeLog, err := logging.New(logging.Options{
     File:    &logging.FileOptions{Dir: cfg.Logging.Directory, MaxSizeMB: 50, MaxBackups: 7, MaxAgeDays: 30, Compress: true},
 })
 defer closeLog()
-
-r.Use(middleware.RequestID, middleware.RealIP, logging.Middleware(root), middleware.Recoverer)
-grpc.NewServer(grpc.ChainUnaryInterceptor(logging.UnaryServerInterceptor(root)))
-grpc.NewClient(target, grpc.WithChainUnaryInterceptor(logging.UnaryClientInterceptor()))
 ```
 
-- `Middleware` (after chi's `RequestID` + `RealIP`): scoped logger in
-  `r.Context()`, one `request` line per call with status/bytes/latency.
-- `UnaryServerInterceptor`: the same for gRPC (`rpc`, `code`), request id
-  from the `x-request-id` metadata or minted.
-- `UnaryClientInterceptor`: forwards the request id, so one id spans a
-  reports → projects → core chain.
-- `Enrich(ctx, fn)`: add fields in place for the rest of the request.
-- Workers take the logger in their constructor and derive a per-run
-  context (`ExampleNew`).
+| Stack | Wiring | Logger in the handler |
+|---|---|---|
+| net/http, chi, gorilla | `r.Use(logging.Middleware(root))` (after RealIP, before Recoverer) | `zerolog.Ctx(r.Context())` |
+| Fiber v3 | `app.Use(fiberv3.Logging(root))` | `zerolog.Ctx(c.Context())` |
+| Fiber v2 | `app.Use(fiberv2.Logging(root))` | `zerolog.Ctx(c.UserContext())` — **not** `c.Context()`, that is the fasthttp ctx |
+| gRPC server | `grpc.ChainUnaryInterceptor(grpclog.UnaryServerInterceptor(root))` | `zerolog.Ctx(ctx)` |
+| gRPC client | `grpc.WithChainUnaryInterceptor(grpclog.UnaryClientInterceptor())` | forwards `x-request-id` |
+| worker / cron | constructor takes `zerolog.Logger`, derives a per-run ctx | `zerolog.Ctx(ctx)` |
 
-No package-level `Info()`/`Fatal()` wrappers on purpose: the dependency is
-explicit, tests pass `zerolog.Nop()`. The only global is
-`zerolog.DefaultContextLogger`, set to the root so a bare
-`context.Background()` still logs with the service name.
+Every adapter does the same three things: request-scoped logger with
+`request_id`, `method`, `path`, `ip` into the context; one `request` /
+`rpc` line with status, bytes, latency; `X-Request-ID` taken from the
+caller or minted and echoed back, so one id follows a request across
+services. `logging.Enrich(ctx, fn)` adds fields in place (`user_id` after
+auth). No package-level `Info()`/`Fatal()`; tests pass `zerolog.Nop()`.

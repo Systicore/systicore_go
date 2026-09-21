@@ -4,12 +4,11 @@ import (
 	"context"
 	"net/http"
 
-	"github.com/go-chi/chi/v5"
-	"github.com/go-chi/chi/v5/middleware"
 	"github.com/rs/zerolog"
 	"google.golang.org/grpc"
 
 	"github.com/Systicore/systicore_go/logging"
+	"github.com/Systicore/systicore_go/logging/grpclog"
 )
 
 // ExampleNew shows the wiring in a service's main: one root logger, chi and
@@ -21,14 +20,15 @@ func ExampleNew() {
 	}
 	defer closeLog()
 
-	r := chi.NewRouter()
-	r.Use(middleware.RequestID, middleware.RealIP, logging.Middleware(root), middleware.Recoverer)
-	r.Get("/api/v1/admin/reports", func(w http.ResponseWriter, r *http.Request) {
+	// net/http, chi, gorilla — all take the same func(http.Handler) http.Handler.
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/admin/reports", func(w http.ResponseWriter, r *http.Request) {
 		// Handlers and everything below them use the context logger.
 		zerolog.Ctx(r.Context()).Info().Msg("listing reports")
 	})
+	_ = logging.Middleware(root)(mux)
 
-	_ = grpc.NewServer(grpc.ChainUnaryInterceptor(logging.UnaryServerInterceptor(root)))
+	_ = grpc.NewServer(grpc.ChainUnaryInterceptor(grpclog.UnaryServerInterceptor(root)))
 	_ = newWorker(root)
 }
 

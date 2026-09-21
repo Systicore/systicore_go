@@ -10,13 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/go-chi/chi/v5"
-	"github.com/go-chi/chi/v5/middleware"
 	"github.com/rs/zerolog"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/metadata"
-	"google.golang.org/grpc/status"
 )
 
 // rootTo builds a root logger that writes JSON lines into buf.
@@ -65,9 +59,8 @@ func TestNewWritesFileAndFallsBackOnBadLevel(t *testing.T) {
 
 func TestMiddlewareScopesLoggerAndLogsAccessLine(t *testing.T) {
 	var buf bytes.Buffer
-	r := chi.NewRouter()
-	r.Use(middleware.RequestID, Middleware(rootTo(&buf)))
-	r.Get("/reports/{id}", func(w http.ResponseWriter, r *http.Request) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /reports/{id}", func(w http.ResponseWriter, r *http.Request) {
 		// Domain code: only zerolog.Ctx, nothing from this package.
 		zerolog.Ctx(r.Context()).Warn().Msg("from handler")
 		Enrich(r.Context(), func(c zerolog.Context) zerolog.Context { return c.Int64("user_id", 42) })
@@ -78,18 +71,23 @@ func TestMiddlewareScopesLoggerAndLogsAccessLine(t *testing.T) {
 		w.WriteHeader(http.StatusCreated)
 		_, _ = w.Write([]byte("ok"))
 	})
+	handler := Middleware(rootTo(&buf))(mux)
 
 	req := httptest.NewRequest(http.MethodGet, "/reports/7", nil)
 	req.RemoteAddr = "10.0.0.9:1234"
+	req.Header.Set(RequestIDKey, "req-abc")
 	rec := httptest.NewRecorder()
-	r.ServeHTTP(rec, req)
+	handler.ServeHTTP(rec, req)
+	if rec.Header().Get(RequestIDKey) != "req-abc" {
+		t.Error("the request id must be echoed in the response header")
+	}
 
 	got := lines(t, &buf)
 	if len(got) != 3 {
 		t.Fatalf("want 3 lines (handler, enriched, access), got %d: %s", len(got), buf.String())
 	}
 	handlerLine, enriched, access := got[0], got[1], got[2]
-	if handlerLine["message"] != "from handler" || handlerLine["method"] != "GET" || handlerLine["path"] != "/reports/7" || handlerLine["ip"] != "10.0.0.9:1234" || handlerLine["request_id"] == "" {
+	if handlerLine["message"] != "from handler" || handlerLine["method"] != "GET" || handlerLine["path"] != "/reports/7" || handlerLine["ip"] != "10.0.0.9:1234" || handlerLine["request_id"] != "req-abc" {
 		t.Errorf("handler line lacks request fields: %v", handlerLine)
 	}
 	if _, present := handlerLine["user_id"]; present {
@@ -106,50 +104,18 @@ func TestMiddlewareScopesLoggerAndLogsAccessLine(t *testing.T) {
 	}
 }
 
-func TestGRPCInterceptorsPropagateRequestID(t *testing.T) {
+func TestMiddlewareMintsRequestIDAndKeepsDefaultStatus(t *testing.T) {
 	var buf bytes.Buffer
-	server := UnaryServerInterceptor(rootTo(&buf))
-	info := &grpc.UnaryServerInfo{FullMethod: "/systicore.projects.v1.ReportSourcesService/Resolve"}
-
-	// Incoming call that carries an id from the caller.
-	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs(RequestIDKey, "req-123"))
-	var seen string
-	_, err := server(ctx, nil, info, func(ctx context.Context, _ any) (any, error) {
-		seen = RequestID(ctx)
-		zerolog.Ctx(ctx).Info().Msg("in rpc")
-		return nil, status.Error(codes.NotFound, "no such source")
-	})
-	if err == nil || seen != "req-123" {
-		t.Fatalf("handler ctx request id = %q, err = %v", seen, err)
+	handler := Middleware(rootTo(&buf))(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("implicit 200"))
+	}))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	if rec.Header().Get(RequestIDKey) == "" {
+		t.Error("a request id must be minted when the caller sends none")
 	}
 	got := lines(t, &buf)
-	if len(got) != 2 || got[0]["request_id"] != "req-123" || got[0]["rpc"] != info.FullMethod {
-		t.Fatalf("rpc-scoped logger wrong: %v", got)
-	}
-	if got[1]["message"] != "rpc" || got[1]["code"] != "NotFound" || got[1]["level"] != "warn" {
-		t.Errorf("call line wrong: %v", got[1])
-	}
-
-	// Without an incoming id one is minted.
-	buf.Reset()
-	_, _ = server(context.Background(), nil, info, func(ctx context.Context, _ any) (any, error) {
-		if RequestID(ctx) == "" {
-			t.Error("a request id must be minted when none arrives")
-		}
-		return nil, nil
-	})
-
-	// Client side: the id in ctx becomes outgoing metadata.
-	var forwarded string
-	invoker := func(ctx context.Context, _ string, _, _ any, _ *grpc.ClientConn, _ ...grpc.CallOption) error {
-		md, _ := metadata.FromOutgoingContext(ctx)
-		if v := md.Get(RequestIDKey); len(v) > 0 {
-			forwarded = v[0]
-		}
-		return nil
-	}
-	_ = UnaryClientInterceptor()(WithRequestID(context.Background(), "req-123"), "/x", nil, nil, nil, invoker)
-	if forwarded != "req-123" {
-		t.Errorf("client interceptor forwarded %q, want req-123", forwarded)
+	if len(got) != 1 || got[0]["status"] != float64(200) || got[0]["bytes"] != float64(12) {
+		t.Errorf("access line = %v", got)
 	}
 }
