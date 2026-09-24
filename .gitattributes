@@ -1,0 +1,3 @@
+# Normalise every text file to LF in the repository and the working tree,
+# so gofmt sees the same bytes on Windows checkouts as in CI.
+* text=auto eol=lf
