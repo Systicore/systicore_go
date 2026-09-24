@@ -3,6 +3,7 @@
 package fiberv2
 
 import (
+	"strings"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -27,6 +28,10 @@ func Logging(root zerolog.Logger) fiber.Handler {
 		if id == "" {
 			id = uuid.NewString()
 		}
+		// c.Get and c.GetRespHeader alias fasthttp buffers that the next
+		// request reuses; the id outlives the handler in the context
+		// (goroutines, queued error reports), so it gets its own copy.
+		id = strings.Clone(id)
 		c.Set(logging.RequestIDKey, id)
 
 		l := root.With().

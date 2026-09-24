@@ -2,105 +2,168 @@ package report
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"sync/atomic"
 	"time"
 )
 
 // Capture enqueues a report and returns immediately. The sender goroutine
-// submits it with retries; a full queue drops the report and logs the
-// drop count (rate-limited) rather than blocking the caller — an error
-// reporter must never become the outage.
-func (c *Client) Capture(ctx context.Context, r Report) {
-	select {
-	case <-c.closing:
+// delivers it; a full queue, a closed client or an open circuit drops the
+// report and counts the drop (logged at most once a minute) rather than
+// blocking the caller — an error reporter must never become the outage.
+// Capture also marks ctx's scope as captured (see WithScope and
+// Captured). A disabled or nil client ignores the call.
+func (c *Client) Capture(ctx context.Context, report Report) {
+	markCaptured(ctx)
+	c.enqueue(ctx, report)
+}
+
+// enqueue is Capture without marking the scope: the log bridges use it,
+// since a log line must not silence the explicit capture that may follow.
+func (c *Client) enqueue(ctx context.Context, report Report) {
+	if !c.Enabled() {
+		return
+	}
+	report = detach(c.prepare(ctx, report))
+	c.closeMutex.RLock()
+	defer c.closeMutex.RUnlock()
+	if c.closed {
 		c.dropped.hit(c, "client closed")
 		return
-	default:
 	}
 	select {
-	case c.queue <- queued{report: r}:
+	case c.queue <- report:
 	default:
 		c.dropped.hit(c, "queue full")
 	}
 }
 
-// Dropped returns how many reports were dropped since start (queue full
-// or closed) — worth a gauge in the service's metrics.
-func (c *Client) Dropped() int64 { return c.dropped.n.Load() }
+// detach copies every string of a report that is about to outlive the
+// caller. Zero-copy frameworks (Fiber / fasthttp) hand out strings that
+// alias request buffers reused by the next request, so a route, request
+// id or error text taken from them would change under the sender.
+func detach(report Report) Report {
+	report.Type = strings.Clone(report.Type)
+	report.Code = strings.Clone(report.Code)
+	report.Message = strings.Clone(report.Message)
+	report.Trace = strings.Clone(report.Trace)
+	report.Action = strings.Clone(report.Action)
+	report.Fingerprint = strings.Clone(report.Fingerprint)
+	report.User.ID = strings.Clone(report.User.ID)
+	report.User.Issuer = strings.Clone(report.User.Issuer)
+	report.Context.Route = strings.Clone(report.Context.Route)
+	report.Context.RequestID = strings.Clone(report.Context.RequestID)
+	if report.Context.Tags != nil {
+		tags := make(map[string]string, len(report.Context.Tags))
+		for key, value := range report.Context.Tags {
+			tags[strings.Clone(key)] = strings.Clone(value)
+		}
+		report.Context.Tags = tags
+	}
+	return report
+}
+
+// Dropped returns how many reports were dropped since start (queue full,
+// client closed, circuit open) — worth a gauge in the service's metrics.
+func (c *Client) Dropped() int64 {
+	if !c.Enabled() {
+		return 0
+	}
+	return c.dropped.total.Load()
+}
 
 // Close stops accepting reports and flushes what is queued, bounded by
-// ctx. Reports still queued when ctx expires are dropped.
+// ctx: when ctx ends first, the sender is cancelled and whatever is still
+// queued is lost. Close is idempotent and a no-op on a disabled client.
 func (c *Client) Close(ctx context.Context) error {
-	select {
-	case <-c.closing:
+	if !c.Enabled() {
 		return nil
-	default:
-		close(c.closing)
 	}
-	close(c.queue)
+	c.closeMutex.Lock()
+	if !c.closed {
+		c.closed = true
+		close(c.queue)
+	}
+	c.closeMutex.Unlock()
 	select {
 	case <-c.done:
 		return nil
 	case <-ctx.Done():
+		c.stopSender()
 		return ctx.Err()
 	}
 }
 
-// run is the single sender: reports go out one at a time, in order, each
-// with the Submit retry policy. A permanent rejection is logged with the
-// report's identity so the payload bug is findable; a transient failure
-// that exhausts the attempts is logged and the report is dropped — the
-// backend dedups, so the next occurrence will carry the count anyway.
+// run is the single sender: reports go out one at a time, in order.
 func (c *Client) run() {
 	defer close(c.done)
-	for q := range c.queue {
-		ctx, cancel := context.WithTimeout(context.Background(), c.sendBudget())
-		err := c.Submit(ctx, q.report)
-		cancel()
-		if err != nil {
-			c.log.Warn().Err(err).
-				Str("code", q.report.Code).
-				Str("action", q.report.Action).
-				Msg("error report not delivered")
+	defer c.stopSender()
+	for report := range c.queue {
+		if c.senderContext.Err() != nil {
+			c.dropped.hit(c, "client closed before the queue was flushed")
+			continue
 		}
+		c.recordUndelivered(report, c.deliver(c.senderContext, report))
 	}
 }
 
-// sendBudget bounds one report's total time: every attempt's timeout plus
-// the backoffs between them.
-func (c *Client) sendBudget() time.Duration {
-	perAttempt := c.http.Timeout
-	if perAttempt <= 0 {
-		perAttempt = 10 * time.Second
+// finalDeliveryTimeout bounds deliverBeforeExit: long enough for one
+// round trip and a retry, short enough not to hold up a dying process.
+const finalDeliveryTimeout = 2 * time.Second
+
+// deliverBeforeExit sends a report synchronously, bounded by
+// finalDeliveryTimeout, for the moments right before the process ends
+// (zerolog's Fatal exits right after its hooks ran), when a queued report
+// would die with the sender goroutine. Failures are recorded like the
+// sender's.
+func (c *Client) deliverBeforeExit(ctx context.Context, report Report) {
+	deliveryContext, cancel := context.WithTimeout(context.Background(), finalDeliveryTimeout)
+	defer cancel()
+	report = c.prepare(ctx, report)
+	c.recordUndelivered(report, c.deliver(deliveryContext, report))
+}
+
+// recordUndelivered accounts for a delivery that failed (err != nil). A
+// rejected key only counts a drop, since the circuit breaker logged it
+// once already. Any other failure is logged with the report's identity,
+// so a payload bug can be found. The report itself is dropped: the backend
+// groups, so the next occurrence still counts.
+func (c *Client) recordUndelivered(report Report, err error) {
+	switch {
+	case err == nil:
+	case errors.Is(err, ErrCircuitOpen):
+		c.dropped.hit(c, "ingest key rejected, sending paused")
+	case errors.Is(err, ErrUnauthorized):
+		c.dropped.hit(c, "ingest key rejected")
+	default:
+		c.logger.Warn().Err(err).
+			Str("type", report.Type).
+			Str("code", report.Code).
+			Str("action", report.Action).
+			Msg("error report not delivered")
 	}
-	budget := time.Duration(c.opt.Attempts) * perAttempt
-	backoff := c.opt.Backoff
-	for i := 1; i < c.opt.Attempts; i++ {
-		budget += backoff
-		backoff *= 2
-	}
-	return budget
 }
 
 // dropCounter counts drops and logs at most once per minute so a flood of
 // errors cannot also flood the log.
 type dropCounter struct {
-	n        atomic.Int64
-	lastLog  atomic.Int64 // unix nanos
-	sinceLog atomic.Int64
+	total     atomic.Int64
+	lastLog   atomic.Int64 // unix nanos
+	sinceLast atomic.Int64
 }
 
 func (d *dropCounter) hit(c *Client, reason string) {
-	d.n.Add(1)
-	d.sinceLog.Add(1)
+	d.total.Add(1)
+	d.sinceLast.Add(1)
 	now := time.Now().UnixNano()
 	last := d.lastLog.Load()
 	if now-last < int64(time.Minute) || !d.lastLog.CompareAndSwap(last, now) {
 		return
 	}
-	c.log.Warn().
+	c.logger.Warn().
 		Str("reason", reason).
-		Int64("dropped_since_last_log", d.sinceLog.Swap(0)).
-		Int64("dropped_total", d.n.Load()).
+		Int64("dropped_since_last_log", d.sinceLast.Swap(0)).
+		Int64("dropped_total", d.total.Load()).
 		Msg("error reports dropped")
 }
