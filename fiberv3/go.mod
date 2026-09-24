@@ -3,10 +3,8 @@ module github.com/Systicore/systicore_go/fiberv3
 go 1.26
 
 // Own module so the root stays framework-free and fiber v3's fasthttp pin
-// never leaks into chi / net/http consumers. Until the root is tagged the
-// adapter builds against the sibling checkout; on release replace this
-// with `require github.com/Systicore/systicore_go vX.Y.Z` and drop the replace.
-require github.com/Systicore/systicore_go v0.0.0
+// never leaks into chi / net/http consumers.
+require github.com/Systicore/systicore_go v0.1.0
 
 require (
 	github.com/gofiber/fiber/v3 v3.5.0
@@ -31,5 +29,3 @@ require (
 	golang.org/x/text v0.40.0 // indirect
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
 )
-
-replace github.com/Systicore/systicore_go => ../

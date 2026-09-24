@@ -4,10 +4,8 @@ go 1.26
 
 // Own module: Fiber v2 pins an older fasthttp than v3 (both import the
 // unversioned github.com/valyala/fasthttp path), so keeping the majors in
-// separate modules stops MVS from dragging v2 users onto v3's pin. Until
-// the root is tagged the adapter builds against the sibling checkout; on
-// release require a real root version and drop the replace.
-require github.com/Systicore/systicore_go v0.0.0
+// separate modules stops MVS from dragging v2 users onto v3's pin.
+require github.com/Systicore/systicore_go v0.1.0
 
 require (
 	github.com/gofiber/fiber/v2 v2.52.15
@@ -27,5 +25,3 @@ require (
 	golang.org/x/sys v0.47.0 // indirect
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
 )
-
-replace github.com/Systicore/systicore_go => ../
