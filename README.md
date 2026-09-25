@@ -40,11 +40,11 @@ Rules that keep it usable everywhere:
 
 Three modules, three tag series, all semver:
 
-| Module | Tag |
-|---|---|
-| root | `v0.1.0` |
-| fiberv3 | `fiberv3/v0.1.0` |
-| fiberv2 | `fiberv2/v0.1.0` |
+| Module | Released | Next (see [Changelog](#changelog)) |
+|---|---|---|
+| root | `v0.1.0` | no release pending |
+| fiberv3 | `fiberv3/v0.1.0` | `fiberv3/v0.2.0` |
+| fiberv2 | `fiberv2/v0.1.0` | `fiberv2/v0.2.0` |
 
 Consumers, once published (see [Releasing](#releasing)):
 
@@ -193,6 +193,13 @@ reporter := fiberv3.NewReporter(reports, fiberv3.ReportOptions{
 app := fiber.New(fiber.Config{ErrorHandler: reporter.ErrorHandler(errorHandler)})
 app.Use(recover.New(reporter.RecoverConfig())) // replaces recover.New()
 app.Use(fiberv3.Logging(root))
+app.Use(reporter.WrittenServerErrors(fiberv3.WrittenErrorOptions{ // 5xx a handler wrote itself
+    Cause: func(c fiber.Ctx) error { // optional: the error your "log and answer 500" helper stored
+        cause, _ := c.Locals(localServerError).(error)
+        return cause
+    },
+    Skip: func(c fiber.Ctx) bool { return c.Route().Path == "/health" }, // optional
+}))
 ```
 
 - `RecoverConfig()` sets recover's `PanicHandler`, which runs inside the
@@ -215,19 +222,54 @@ app.Use(fiberv3.Logging(root))
   into (`Capture` / `CaptureError` on a `report.WithScope` ctx, see
   `report.Captured`). A handler's `report.MarkReported` silences its log
   line and nothing else, so the adapter still reports the 5xx.
+- `WrittenServerErrors(options)` (fiberv3 v0.2.0) covers the handlers
+  that write a 5xx themselves — `c.Status(500).JSON(…)`, then `return
+  nil` — which hand Fiber no error, so the ErrorHandler never sees them.
+  After the chain it reports a 5xx status once, at severity error, with
+  the same action, route, request id, status tag and user. The response
+  body is never read: it can echo internal details. Without a cause the
+  report is code `http.<status>` with the message
+  `handler answered 503 Service Unavailable`, no type and no trace, so
+  the backend groups it per route and status.
+  - `Cause` returns the error the app recorded for the 5xx, usually from
+    `c.Locals`; the report is then built from it like a returned error
+    (type from the chain, code from a `report.Coder`, message the error
+    text). A nil return falls back to the status-only report.
+  - `Skip` leaves expected 5xx out, e.g. a health probe's 503 that
+    restates an outage the failing routes already report. It runs after
+    the handler, so `c.Route()` is the route that answered.
+  - A panic inside either hook is swallowed (Cause → status-only report,
+    Skip → reported); the written answer always reaches the client.
+- Nothing is reported twice, in whatever order the middlewares are
+  registered: a returned error passes through to the ErrorHandler (also
+  when Fiber's `logger` middleware calls it inside the chain and returns
+  nil), a panic stays with the recover reporter, and every path marks
+  the request as reported, so registering the middleware twice is
+  harmless too. The middleware installs `report.WithScope` on
+  `c.Context()`, so a handler's own `Capture` / `CaptureError` there
+  counts and the 5xx it then writes is not reported again.
+- Replacing an app's own "report written 5xx" middleware: pass its
+  cause getter as `Cause` and its route exclusions as `Skip`; an app
+  that records only a response code returns an error implementing
+  `report.Coder` from `Cause`. A status-only report groups by code
+  `http.<status>` and the action, so if the app's glue reported a
+  different type or message, the first occurrence after the switch
+  opens a new group per route.
 
 ### Fiber v2
 
 Same API over `*fiber.Ctx`; the request's context is `c.UserContext()`.
 Fiber v2's recover has no `PanicHandler`, so `RecoverConfig()` reports
 from `StackTraceHandler` (with `EnableStackTrace: true`; the stderr dump
-is replaced by the report):
+is replaced by the report). `WrittenServerErrors` (fiberv2 v0.2.0)
+installs its scope on `c.UserContext()`:
 
 ```go
 reporter := fiberv2.NewReporter(reports, fiberv2.ReportOptions{User: currentUser})
 app := fiber.New(fiber.Config{ErrorHandler: reporter.ErrorHandler(errorHandler)})
 app.Use(recover.New(reporter.RecoverConfig()))
 app.Use(fiberv2.Logging(root))
+app.Use(reporter.WrittenServerErrors(fiberv2.WrittenErrorOptions{Cause: recordedCause}))
 ```
 
 ### Goroutines, workers, jobs
@@ -303,41 +345,80 @@ does not count as a capture for the Fiber adapters.
 on `server.Requests()` (decoded body, headers). `NewStatusServer` and
 `NewScriptedServer` script 401 / 429 / 5xx answers.
 
+## Changelog
+
+### fiberv3/v0.2.0, fiberv2/v0.2.0 — unreleased
+
+Minor releases: new API, nothing existing changes behaviour. Both still
+require the root at `v0.1.0`.
+
+- Added `Reporter.WrittenServerErrors(WrittenErrorOptions)`, the
+  middleware for 5xx answers a handler writes itself and returns nil
+  for, which the `ErrorHandler` never sees (see [Fiber v3](#fiber-v3)).
+  It reports each such 5xx once, never from the response body, and
+  cooperates with the `ErrorHandler` and `RecoverConfig` so a request is
+  reported by whichever path saw it first and by no other. It replaces
+  the app-side middlewares reverba_backend, spike_backend and
+  tarp-crm_backend built for this.
+- Added `WrittenErrorOptions.Cause`, the documented hook for the error an
+  app recorded for a written 5xx (e.g. in `c.Locals`), and
+  `WrittenErrorOptions.Skip` for expected 5xx such as a health probe's.
+- `ErrorHandler`, `RecoverConfig` and `ReportOptions.User` behave as in
+  v0.1.0; they now share the "already reported" mark with the new
+  middleware.
+
+### systicore_go (root) — no release
+
+Since `v0.1.0` only the tests changed: the fake ingest keys are built at
+runtime from repeated characters, so secret scanners have no key-shaped
+high-entropy literal to flag.
+
+### v0.1.0, fiberv3/v0.1.0, fiberv2/v0.1.0
+
+First release: `logging` with the net/http, gRPC and Fiber adapters, the
+`report` client for the key-based ingest (contract v1.1), and the Fiber
+panic and 5xx reporters (`RecoverConfig`, `ErrorHandler`).
+
 ## Releasing
 
-Publishing is a separate, explicitly confirmed step: it creates the
-public GitHub repository and pushes tags. The order matters, because
-once the `replace` is gone the adapters resolve the root through the
-module proxy:
+Publishing is a separate, explicitly confirmed step: it pushes tags. The
+adapters require the root by version, with no `replace`, so they resolve
+it through the module proxy and the order matters:
 
 1. On a green `main` (CI runs gofmt, vet, `go test -race` and a
-   `go mod tidy` diff in all three modules), tag and push the root:
+   `go mod tidy` diff in all three modules), tag and push the root when
+   it changed, e.g.:
    ```bash
-   git tag v0.1.0 && git push origin v0.1.0
+   git tag vX.Y.Z && git push origin vX.Y.Z
    ```
-2. Point both adapters at that tag and drop the local `replace`. In
-   `fiberv3/go.mod` and `fiberv2/go.mod` change
-   `require github.com/Systicore/systicore_go v0.0.0` to `v0.1.0`, delete
-   the line `replace github.com/Systicore/systicore_go => ../` together
-   with the comment about it, then in each adapter run:
+2. When an adapter needs that new root API, bump its `require` to the
+   tag just pushed — never to an untagged version — then in that adapter
+   run:
    ```bash
+   GOWORK=off go get github.com/Systicore/systicore_go@vX.Y.Z
    GOWORK=off go mod tidy && GOWORK=off go test ./...
    ```
    `GOWORK=off` keeps `go.work` from masking a missing requirement; the
    workspace file itself stays for local development. Commit
-   (`fiberv2, fiberv3: require systicore_go v0.1.0`) and push.
-3. Tag the adapters on that commit and push the tags:
+   (`fiberv2, fiberv3: require systicore_go vX.Y.Z`) and push.
+3. Tag the adapters on that commit (`fiberv3/vA.B.C`, `fiberv2/vA.B.C`)
+   and push the tags.
+4. Check from outside the workspace that the proxy serves them:
    ```bash
-   git tag fiberv3/v0.1.0 && git tag fiberv2/v0.1.0
-   git push origin fiberv3/v0.1.0 fiberv2/v0.1.0
-   ```
-4. Check from outside the workspace that the proxy serves all three:
-   ```bash
-   GOWORK=off go list -m github.com/Systicore/systicore_go@v0.1.0 \
-       github.com/Systicore/systicore_go/fiberv3@v0.1.0 \
-       github.com/Systicore/systicore_go/fiberv2@v0.1.0
+   GOWORK=off go list -m github.com/Systicore/systicore_go@vX.Y.Z \
+       github.com/Systicore/systicore_go/fiberv3@vA.B.C
    ```
 
-Later releases repeat the order: root tag first, then bump the adapters'
-`require`, then their tags. A release that changes only an adapter needs
-only that adapter's tag.
+A release that changes only an adapter skips steps 1 and 2.
+
+The pending release is of that kind: `fiberv3/v0.2.0` and
+`fiberv2/v0.2.0` use only root API that `v0.1.0` already has, and the
+root's own changes since `v0.1.0` are test-only, so no root tag and no
+`require` bump are needed:
+
+```bash
+git tag fiberv3/v0.2.0 && git tag fiberv2/v0.2.0
+git push origin fiberv3/v0.2.0 fiberv2/v0.2.0
+GOWORK=off go list -m github.com/Systicore/systicore_go/fiberv3@v0.2.0 \
+    github.com/Systicore/systicore_go/fiberv2@v0.2.0
+```
