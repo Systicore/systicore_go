@@ -22,7 +22,14 @@ import (
 	"github.com/Systicore/systicore_go/report/reporttest"
 )
 
-const testKey = "scsk_test_0123456789abcdefghijklmnopqrstuv"
+// The fake ingest keys are built at runtime from repeated characters: a
+// key-shaped literal with a high-entropy random part is exactly what
+// secret scanners (gitleaks' generic-api-key rule) flag, even in a test.
+var (
+	// testRandomPart is a valid 32-character random part.
+	testRandomPart = strings.Repeat("0", 32)
+	testKey        = "scsk_test_" + testRandomPart
+)
 
 // fakeClock is a clock whose Sleep returns at once and advances Now, and
 // records every wait so tests can assert backoff and Retry-After.
@@ -264,14 +271,14 @@ func TestNewRejectsMalformedConfiguration(t *testing.T) {
 		"url without scheme":      {BaseURL: "reports.systicore.hu", Key: testKey},
 		"non-http scheme":         {BaseURL: "ftp://reports.systicore.hu", Key: testKey},
 		"not an ingest key":       {BaseURL: "https://reports.systicore.hu", Key: "Bearer abc"},
-		"unknown environment":     {BaseURL: "https://reports.systicore.hu", Key: "scsk_prod_0123456789abcdefghijklmnopqrstuv"},
-		"random part too short":   {BaseURL: "https://reports.systicore.hu", Key: "scsk_live_0123456789"},
+		"unknown environment":     {BaseURL: "https://reports.systicore.hu", Key: "scsk_prod_" + testRandomPart},
+		"random part too short":   {BaseURL: "https://reports.systicore.hu", Key: "scsk_live_" + testRandomPart[:10]},
 		"random part too long":    {BaseURL: "https://reports.systicore.hu", Key: testKey + "w"},
-		"non-base62 random part":  {BaseURL: "https://reports.systicore.hu", Key: "scsk_test_0123456789abcdefghijklmnopqrst-_"},
-		"carriage return inside":  {BaseURL: "https://reports.systicore.hu", Key: "scsk_test_0123456789abcdef\rghijklmnopqrstuv"},
-		"type in the wrong case":  {BaseURL: "https://reports.systicore.hu", Key: "SCSK_test_0123456789abcdefghijklmnopqrstuv"},
-		"unknown type":            {BaseURL: "https://reports.systicore.hu", Key: "scrk_test_0123456789abcdefghijklmnopqrstuv"},
-		"missing environment tag": {BaseURL: "https://reports.systicore.hu", Key: "scsk_0123456789abcdefghijklmnopqrstuv"},
+		"non-base62 random part":  {BaseURL: "https://reports.systicore.hu", Key: "scsk_test_" + testRandomPart[:30] + "-_"},
+		"carriage return inside":  {BaseURL: "https://reports.systicore.hu", Key: "scsk_test_" + testRandomPart[:16] + "\r" + testRandomPart[16:]},
+		"type in the wrong case":  {BaseURL: "https://reports.systicore.hu", Key: "SCSK_test_" + testRandomPart},
+		"unknown type":            {BaseURL: "https://reports.systicore.hu", Key: "scrk_test_" + testRandomPart},
+		"missing environment tag": {BaseURL: "https://reports.systicore.hu", Key: "scsk_" + testRandomPart},
 		// The pre-v1.1 types, built rather than spelled out: written as
 		// literals they have the shape secret scanners flag as Stripe keys.
 		"legacy secret type": {BaseURL: "https://reports.systicore.hu", Key: strings.TrimPrefix(testKey, "sc")},
@@ -289,7 +296,8 @@ func TestNewRejectsMalformedConfiguration(t *testing.T) {
 }
 
 func TestNewAcceptsBothKeyTypesInBothEnvironments(t *testing.T) {
-	const randomPart = "0123456789abcdefghijklmnopqrstuv"
+	// Both letter cases and digits, still low-entropy (see testRandomPart).
+	randomPart := strings.Repeat("Az09", 8)
 	for _, key := range []string{
 		"scsk_live_" + randomPart,
 		"scsk_test_" + randomPart,
