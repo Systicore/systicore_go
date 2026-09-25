@@ -50,9 +50,13 @@ Consumers, once published (see [Releasing](#releasing)):
 
 ```bash
 go get github.com/Systicore/systicore_go@v0.1.0
-go get github.com/Systicore/systicore_go/fiberv3@v0.1.0   # Fiber v3 services
-go get github.com/Systicore/systicore_go/fiberv2@v0.1.0   # Fiber v2 services
+go get github.com/Systicore/systicore_go/fiberv3@v0.2.0   # Fiber v3 services
+go get github.com/Systicore/systicore_go/fiberv2@v0.2.0   # Fiber v2 services
 ```
+
+These are the versions this README documents. `WrittenServerErrors`
+needs the adapters at `v0.2.0` or later; everything else works from
+`v0.1.0`.
 
 The module path is case-sensitive: `github.com/Systicore/...` with a
 capital S, in imports and in any `GOPRIVATE` pattern.
@@ -198,6 +202,10 @@ app.Use(reporter.WrittenServerErrors(fiberv3.WrittenErrorOptions{ // 5xx a handl
         cause, _ := c.Locals(localServerError).(error)
         return cause
     },
+    Code: func(c fiber.Ctx) string { // optional: the code your error envelope answered with
+        code, _ := c.Locals(localErrorCode).(string)
+        return code
+    },
     Skip: func(c fiber.Ctx) bool { return c.Route().Path == "/health" }, // optional
 }))
 ```
@@ -228,18 +236,29 @@ app.Use(reporter.WrittenServerErrors(fiberv3.WrittenErrorOptions{ // 5xx a handl
   After the chain it reports a 5xx status once, at severity error, with
   the same action, route, request id, status tag and user. The response
   body is never read: it can echo internal details. Without a cause the
-  report is code `http.<status>` with the message
-  `handler answered 503 Service Unavailable`, no type and no trace, so
-  the backend groups it per route and status.
+  report is code `http.<status>` (or the app's own code, see `Code`)
+  with the message `handler answered 503 Service Unavailable`, no type
+  and no trace, so the backend groups it per route, status and code.
   - `Cause` returns the error the app recorded for the 5xx, usually from
     `c.Locals`; the report is then built from it like a returned error
     (type from the chain, code from a `report.Coder`, message the error
-    text). A nil return falls back to the status-only report.
+    text). A nil return falls back to the status-only report. Such a
+    report always has a type (the error's Go type, or `error`), and the
+    backend groups by type before code: causes of one type whose
+    messages normalize alike share a group whatever their `Coder` codes,
+    unless `Error()` includes the code.
+  - `Code` returns the application code the handler answered with, e.g.
+    the error code its response envelope carried, stored in `c.Locals`.
+    A non-empty code replaces `http.<status>` in a report without a
+    cause; that report keeps no type, so different codes on one route
+    and status stay separate groups. With a cause, the cause's own
+    `Coder` code wins and `Code` fills in only when it has none.
   - `Skip` leaves expected 5xx out, e.g. a health probe's 503 that
     restates an outage the failing routes already report. It runs after
     the handler, so `c.Route()` is the route that answered.
-  - A panic inside either hook is swallowed (Cause → status-only report,
-    Skip → reported); the written answer always reaches the client.
+  - A panic inside any hook is swallowed (Cause → status-only report,
+    Code → `http.<status>` or the cause's code, Skip → reported); the
+    written answer always reaches the client.
 - Nothing is reported twice, in whatever order the middlewares are
   registered: a returned error passes through to the ErrorHandler (also
   when Fiber's `logger` middleware calls it inside the chain and returns
@@ -249,12 +268,16 @@ app.Use(reporter.WrittenServerErrors(fiberv3.WrittenErrorOptions{ // 5xx a handl
   `c.Context()`, so a handler's own `Capture` / `CaptureError` there
   counts and the 5xx it then writes is not reported again.
 - Replacing an app's own "report written 5xx" middleware: pass its
-  cause getter as `Cause` and its route exclusions as `Skip`; an app
-  that records only a response code returns an error implementing
-  `report.Coder` from `Cause`. A status-only report groups by code
-  `http.<status>` and the action, so if the app's glue reported a
-  different type or message, the first occurrence after the switch
-  opens a new group per route.
+  cause getter as `Cause`, its response-code getter as `Code` and its
+  route exclusions as `Skip`. An app that records only a response code
+  passes it as `Code`, not wrapped in a `report.Coder` error for
+  `Cause`: the wrapper would give every report a type, which then
+  decides the group instead of the code. A glue that reported
+  `{code: <response code>, message: "handler answered <status>
+  <text>"}` with no type keeps its groups with `Code` alone (except its
+  reports without a code, which become `http.<status>`). If the glue
+  reported a different type or message, the first occurrence after the
+  switch opens a new group per route.
 
 ### Fiber v2
 
@@ -361,8 +384,11 @@ require the root at `v0.1.0`.
   the app-side middlewares reverba_backend, spike_backend and
   tarp-crm_backend built for this.
 - Added `WrittenErrorOptions.Cause`, the documented hook for the error an
-  app recorded for a written 5xx (e.g. in `c.Locals`), and
-  `WrittenErrorOptions.Skip` for expected 5xx such as a health probe's.
+  app recorded for a written 5xx (e.g. in `c.Locals`),
+  `WrittenErrorOptions.Code` for the response code an app recorded
+  instead (it names a report without a cause and keeps it without a
+  type, so each code groups on its own), and `WrittenErrorOptions.Skip`
+  for expected 5xx such as a health probe's.
 - `ErrorHandler`, `RecoverConfig` and `ReportOptions.User` behave as in
   v0.1.0; they now share the "already reported" mark with the new
   middleware.

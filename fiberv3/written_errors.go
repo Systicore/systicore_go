@@ -74,7 +74,7 @@ type WrittenErrorOptions struct {
 // Without a recorded cause the report is Code "http.<status>" (or the
 // app's own code, see WrittenErrorOptions.Code) and Message "handler
 // answered <status> <status text>"; it has no type and no trace, so the
-// backend groups it per route and code.
+// backend groups it per route, status and code.
 //
 // Nothing is reported twice:
 //   - A returned error passes through untouched: the ErrorHandler reports
