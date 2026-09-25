@@ -9,8 +9,8 @@ import (
 	"github.com/Systicore/systicore_go/report"
 )
 
-// WrittenErrorOptions configures Reporter.WrittenServerErrors. Both hooks
-// are optional and called defensively: a panic inside one is swallowed.
+// WrittenErrorOptions configures Reporter.WrittenServerErrors. Every hook
+// is optional and called defensively: a panic inside one is swallowed.
 type WrittenErrorOptions struct {
 	// Cause returns the error behind a 5xx the handler wrote itself, when
 	// the app recorded one — typically read from c.Locals, where its "log
@@ -23,9 +23,33 @@ type WrittenErrorOptions struct {
 	//
 	// The report is then built from that error like one the ErrorHandler
 	// saw: Type from the error chain, Code from a report.Coder, Message the
-	// error text. When Cause is nil, returns nil or panics, the report
-	// names only the status.
+	// error text. When Cause is nil, returns nil or panics, the report is
+	// built from the status and Code instead.
+	//
+	// Such a report always has a Type — the error's Go type, or "error" —
+	// and the backend groups by Type before Code, so a report.Coder's code
+	// does not split groups: causes of one type whose Error() texts
+	// normalize alike share a group whatever their codes, unless Error()
+	// includes the code. An app that records only a response code sets
+	// Code instead of wrapping the code in an error for Cause.
 	Cause func(c *fiber.Ctx) error
+	// Code returns the application code the handler answered with, when
+	// the app keeps one — typically the error code of its response
+	// envelope, stored in c.Locals by the helper that wrote it:
+	//
+	//	Code: func(c *fiber.Ctx) string {
+	//		code, _ := c.Locals(localErrorCode).(string)
+	//		return code
+	//	},
+	//
+	// A non-empty code replaces "http.<status>" in a report without a
+	// cause. That report has no Type, so the backend groups it by this
+	// code, the message and the route: different codes on one route stay
+	// apart. With a cause, the cause's own report.Coder code wins and Code
+	// fills in only when it has none; the grouping then follows the
+	// cause's Type. When Code is nil, returns "" or panics, the code stays
+	// "http.<status>" or the cause's.
+	Code func(c *fiber.Ctx) string
 	// Skip reports whether a written 5xx is expected and must not become a
 	// report, e.g. a health probe's 503 that restates an outage the failing
 	// routes already report with their real cause. It runs after the
@@ -47,9 +71,10 @@ type WrittenErrorOptions struct {
 // the same Action, route, request id, status tag and user as the
 // ErrorHandler's reports. The response body is never read: it can echo
 // internal details, and the handler already chose what the client sees.
-// Without a recorded cause the report is Code "http.<status>" and Message
-// "handler answered <status> <status text>"; it has no trace, so the
-// backend groups it per route and status.
+// Without a recorded cause the report is Code "http.<status>" (or the
+// app's own code, see WrittenErrorOptions.Code) and Message "handler
+// answered <status> <status text>"; it has no type and no trace, so the
+// backend groups it per route and code.
 //
 // Nothing is reported twice:
 //   - A returned error passes through untouched: the ErrorHandler reports
@@ -89,20 +114,45 @@ func (options WrittenErrorOptions) skip(c *fiber.Ctx) bool {
 }
 
 // writtenServerError is the report of a written 5xx: built from the cause
-// the app recorded, else from the status alone. Nothing in it comes from
-// the response. The cause's Error() runs under the same guard as the hook,
-// since it is host code too.
+// the app recorded, else from the status alone, with the app's response
+// code where the report has none of its own. Nothing in it comes from the
+// response.
 func (options WrittenErrorOptions) writtenServerError(c *fiber.Ctx, status int) report.Report {
-	statusOnly := statusReport(status)
-	if options.Cause == nil {
-		return statusOnly
-	}
-	return callHook(func() report.Report {
-		if cause := options.Cause(c); cause != nil {
-			return report.FromError(cause)
+	if failure := options.causeReport(c); failure != nil {
+		if failure.Code == "" {
+			failure.Code = options.responseCode(c)
 		}
-		return statusOnly
-	}, statusOnly)
+		return *failure
+	}
+	failure := statusReport(status)
+	if code := options.responseCode(c); code != "" {
+		failure.Code = code
+	}
+	return failure
+}
+
+// causeReport is the report built from the error the app recorded, nil
+// when there is none. The cause's Error() and Code() run under the same
+// guard as the hook, since they are host code too.
+func (options WrittenErrorOptions) causeReport(c *fiber.Ctx) *report.Report {
+	if options.Cause == nil {
+		return nil
+	}
+	return callHook(func() *report.Report {
+		cause := options.Cause(c)
+		if cause == nil {
+			return nil
+		}
+		failure := report.FromError(cause)
+		return &failure
+	}, nil)
+}
+
+func (options WrittenErrorOptions) responseCode(c *fiber.Ctx) string {
+	if options.Code == nil {
+		return ""
+	}
+	return callHook(func() string { return options.Code(c) }, "")
 }
 
 // statusReport names a written 5xx by its status alone: Code

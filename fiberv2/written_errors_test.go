@@ -130,6 +130,91 @@ func TestWrittenServerErrorsReportsTheRecordedCause(t *testing.T) {
 	}
 }
 
+func TestWrittenServerErrorsNamesAStatusOnlyReportByTheAppsCode(t *testing.T) {
+	server := reporttest.NewServer(t)
+	client := newReportClient(t, server)
+	const errorCodeKey = "error_code"
+	app := newWrittenErrorApp(NewReporter(client, ReportOptions{}), WrittenErrorOptions{
+		Code: func(c *fiber.Ctx) string {
+			code, _ := c.Locals(errorCodeKey).(string)
+			return code
+		},
+	})
+	// The app's helper stores the envelope code it answered with; the
+	// handler then returns nil, so there is no cause, only the code.
+	app.Post("/avatars/:id", func(c *fiber.Ctx) error {
+		code := c.Query("code")
+		if code != "" {
+			c.Locals(errorCodeKey, code)
+		}
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"code": code})
+	})
+
+	for _, target := range []string{"/avatars/7?code=avatars.update_failed", "/avatars/7?code=avatars.storage_full", "/avatars/7"} {
+		send(t, app, http.MethodPost, target)
+	}
+	_ = client.Close(context.Background())
+
+	requests := server.Requests()
+	if len(requests) != 3 {
+		t.Fatalf("reports = %d, want three", len(requests))
+	}
+	for index, wantCode := range []string{"avatars.update_failed", "avatars.storage_full", "http.500"} {
+		errorObject := requests[index].Error()
+		if errorObject["code"] != wantCode || errorObject["message"] != "handler answered 500 Internal Server Error" ||
+			errorObject["action"] != "POST /avatars/:id" {
+			t.Errorf("report %d = %v, want code %q", index, errorObject, wantCode)
+		}
+		// Without a type the backend groups by the code, so two codes on
+		// one route and status stay two groups.
+		if _, hasType := errorObject["type"]; hasType {
+			t.Errorf("report %d must have no type, or it would group by the type instead of the code: %v", index, errorObject)
+		}
+	}
+}
+
+func TestWrittenServerErrorsFillsInTheCodeACauseLacks(t *testing.T) {
+	server := reporttest.NewServer(t)
+	client := newReportClient(t, server)
+	const serverErrorKey, errorCodeKey = "server_error", "error_code"
+	app := newWrittenErrorApp(NewReporter(client, ReportOptions{}), WrittenErrorOptions{
+		Cause: func(c *fiber.Ctx) error {
+			cause, _ := c.Locals(serverErrorKey).(error)
+			return cause
+		},
+		Code: func(c *fiber.Ctx) string {
+			code, _ := c.Locals(errorCodeKey).(string)
+			return code
+		},
+	})
+	app.Get("/invoices/:id", func(c *fiber.Ctx) error {
+		c.Locals(serverErrorKey, fmt.Errorf("load invoice 8812: %w", storageError{}))
+		c.Locals(errorCodeKey, "invoices.load_failed")
+		return c.SendStatus(fiber.StatusInternalServerError)
+	})
+	app.Get("/exports/:id", func(c *fiber.Ctx) error {
+		c.Locals(serverErrorKey, errors.New("export queue full"))
+		c.Locals(errorCodeKey, "exports.queue_full")
+		return c.SendStatus(fiber.StatusServiceUnavailable)
+	})
+
+	send(t, app, http.MethodGet, "/invoices/8812")
+	send(t, app, http.MethodGet, "/exports/3")
+	_ = client.Close(context.Background())
+
+	requests := server.Requests()
+	if len(requests) != 2 {
+		t.Fatalf("reports = %d, want two", len(requests))
+	}
+	coded, uncoded := requests[0].Error(), requests[1].Error()
+	if coded["type"] != "fiberv2.storageError" || coded["code"] != "invoice.store_unavailable" {
+		t.Errorf("the cause's own code must win over the response code: %v", coded)
+	}
+	if uncoded["type"] != "error" || uncoded["code"] != "exports.queue_full" || uncoded["message"] != "export queue full" {
+		t.Errorf("the response code must fill in for a cause without one: %v", uncoded)
+	}
+}
+
 func TestWrittenServerErrorsLeavesReturnedErrorsToTheErrorHandler(t *testing.T) {
 	// One logger per app: it binds the first app's ErrorHandler it sees.
 	quietLogger := func() fiber.Handler { return fiberlogger.New(fiberlogger.Config{Output: io.Discard}) }
@@ -276,6 +361,7 @@ func TestWrittenServerErrorsHooksAndDisabledClientAreHarmless(t *testing.T) {
 	client := newReportClient(t, server)
 	panickingHooks := WrittenErrorOptions{
 		Cause: func(*fiber.Ctx) error { panic("locals type drift") },
+		Code:  func(*fiber.Ctx) string { panic("locals type drift") },
 		Skip:  func(*fiber.Ctx) bool { panic("route table drift") },
 	}
 	for name, app := range map[string]*fiber.App{
@@ -298,6 +384,6 @@ func TestWrittenServerErrorsHooksAndDisabledClientAreHarmless(t *testing.T) {
 		t.Fatalf("reports = %d, want the one from the enabled client", server.Count())
 	}
 	if errorObject := server.Requests()[0].Error(); errorObject["code"] != "http.503" {
-		t.Errorf("a panicking Cause must fall back to the status-only report: %v", errorObject)
+		t.Errorf("panicking Cause and Code hooks must fall back to the status-only report: %v", errorObject)
 	}
 }
