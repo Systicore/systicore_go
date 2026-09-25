@@ -26,8 +26,9 @@ type ReportOptions struct {
 //	reporter := fiberv3.NewReporter(reports, fiberv3.ReportOptions{User: currentUser})
 //	app := fiber.New(fiber.Config{ErrorHandler: reporter.ErrorHandler(errorHandler)})
 //	app.Use(fiberrecover.New(reporter.RecoverConfig()))
+//	app.Use(reporter.WrittenServerErrors(fiberv3.WrittenErrorOptions{})) // 5xx a handler wrote itself
 //
-// Both reports carry Action "<METHOD> <route template>" (c.Route().Path,
+// Every report carries Action "<METHOD> <route template>" (c.Route().Path,
 // never the raw path with ids), the route, the request id and the user.
 // A nil or disabled client makes every hook a no-op, so the wiring can
 // stay in place when REPORTS_URL / REPORTS_KEY are empty.
@@ -41,8 +42,9 @@ func NewReporter(client *report.Client, options ReportOptions) *Reporter {
 	return &Reporter{client: client, options: options}
 }
 
-// reportedKey marks a request whose failure is already reported (the
-// panic path), so the ErrorHandler does not report the resulting 500.
+// reportedKey marks a request whose failure is already reported — by the
+// panic path, the ErrorHandler or WrittenServerErrors — so none of the
+// others reports it again.
 type reportedKey struct{}
 
 // RecoverConfig is the recover middleware configuration that reports
@@ -111,9 +113,14 @@ func (r *Reporter) captureServerError(c fiber.Ctx, err error, status int) {
 	if err == nil || status < fiber.StatusInternalServerError {
 		return
 	}
-	serverError := report.FromError(err)
-	serverError.Severity = report.SeverityError
-	r.client.Capture(c.Context(), r.describeRequest(c, serverError, status))
+	r.captureRequestFailure(c, report.FromError(err), status)
+}
+
+// captureRequestFailure reports a request's 5xx at severity error and
+// marks the request as reported, so no other path repeats it.
+func (r *Reporter) captureRequestFailure(c fiber.Ctx, failure report.Report, status int) {
+	failure.Severity = report.SeverityError
+	r.client.Capture(c.Context(), r.describeRequest(c, failure, status))
 	c.Locals(reportedKey{}, true)
 }
 
@@ -140,14 +147,22 @@ func requestID(c fiber.Ctx) string {
 
 // user calls the host's getter defensively: it runs inside the recover
 // middleware's deferred call, where a second panic would crash the process.
-func (r *Reporter) user(c fiber.Ctx) (user report.User) {
+func (r *Reporter) user(c fiber.Ctx) report.User {
 	if r.options.User == nil {
 		return report.User{}
 	}
+	return callHook(func() report.User { return r.options.User(c) }, report.User{})
+}
+
+// callHook runs a hook the host supplied and returns fallback when it
+// panics. The hooks run where a panic would do harm: inside recover's
+// deferred call, or after the handler wrote its answer, which a panic
+// would replace with a 500.
+func callHook[Result any](hook func() Result, fallback Result) (result Result) {
 	defer func() {
 		if recover() != nil {
-			user = report.User{}
+			result = fallback
 		}
 	}()
-	return r.options.User(c)
+	return hook()
 }

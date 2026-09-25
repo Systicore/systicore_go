@@ -19,11 +19,18 @@ import (
 	"github.com/Systicore/systicore_go/report/reporttest"
 )
 
+// fakeIngestKey is a well-formed secret ingest key built at runtime from a
+// repeated digit: a key-shaped literal with a high-entropy random part is
+// what secret scanners (gitleaks' generic-api-key rule) flag, even in a test.
+func fakeIngestKey() string {
+	return "scsk_test_" + strings.Repeat("0", 32)
+}
+
 func newReportClient(t *testing.T, server *reporttest.Server) *report.Client {
 	t.Helper()
 	client, err := report.New(report.Options{
 		BaseURL:     server.URL,
-		Key:         "scsk_test_0123456789abcdefghijklmnopqrstuv",
+		Key:         fakeIngestKey(),
 		Source:      "spike_backend",
 		Environment: "production",
 	})
