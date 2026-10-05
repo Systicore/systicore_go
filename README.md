@@ -9,6 +9,7 @@ blacklab, bliss, biharvideke, mymosaiq, … — whatever HTTP stack they run.
 systicore_go/                  module github.com/Systicore/systicore_go       ← core: stdlib + zerolog only
 ├── logging/                   New, Options, context helpers, Middleware (net/http)
 ├── logging/grpclog/           gRPC interceptors (compiled only when imported)
+├── httpx/                     net/http toolkit: responses, client IP, recover, security headers, body limit
 ├── report/                    client of the systicore_reports backend (error reports from services)
 ├── report/reporttest/         fake ingest endpoint for tests
 ├── fiberv3/                   module github.com/Systicore/systicore_go/fiberv3  ← Fiber v3 adapters
@@ -95,6 +96,39 @@ succeeded — `/health`, `/health/live`, `/health/ready`, `/healthz`,
 Prometheus polling every few seconds does not bury real traffic, and info
 for everything else, a failing probe included. `logging.IsProbePath` is
 the same set, for a service that wants it elsewhere (rate-limit skips).
+
+## httpx
+
+The net/http toolkit for a service on chi (or any router taking
+`func(http.Handler) http.Handler`). Lifted from systicore_reports_backend,
+the first Systicore backend on chi, so the answers are still the ones the
+Fiber services gave: a framework error is `{"error": <status text>}`, a
+route nothing matches `{"error": "Cannot GET /path"}`.
+
+| | |
+|---|---|
+| `ClientIP(ClientIPOptions)` | rewrites `r.RemoteAddr` to the bare client IP; `X-Forwarded-For` only from trusted proxies, walked from the nearest hop, so a forged leftmost entry is ignored. Mount it first |
+| `Recover(RecoverOptions)` | panic → 500 and an error line on the request logger; `Stack` for development, `OnPanic` to hand it to an error reporter. After `logging.Middleware` |
+| `SecurityHeaders(SecurityHeadersOptions)` | Fiber helmet's defaults written out; options for CORP, `X-Frame-Options`, CSP, HSTS |
+| `MaxBody(max, reject)` | 413 up front for a declared length over the cap, `http.MaxBytesReader` for the rest |
+| `Unless(skip, mw)`, `SkipPaths(mw, paths...)` | keep one middleware off some requests (probes, the Swagger UI) |
+| `JSON`, `Error`, `StatusError`, `NotFound`, `MethodNotAllowed`, `DecodeJSON` | answers and body decoding; `DecodeJSON` returns `ErrBodyTooLarge` past the `MaxBody` cap |
+| `IP(r)`, `ResponseRecorder` | the client address without a port; status and byte count for middleware that needs them |
+
+The order the reports backend runs, and the one to copy:
+
+```go
+r := chi.NewRouter()
+r.Use(httpx.ClientIP(proxyOptions))
+r.Use(logging.Middleware(root))
+r.Use(httpx.Recover(httpx.RecoverOptions{Stack: cfg.IsDevelopment()}))
+r.Use(httpx.SecurityHeaders(httpx.SecurityHeadersOptions{CrossOriginResourcePolicy: "cross-origin"}))
+r.Use(chimiddleware.GetHead) // the Dockerfile healthcheck sends HEAD
+// CORS, rate limiter (httpx.SkipPaths for the probes), metrics …
+r.Use(httpx.MaxBody(cfg.Server.BodyLimit, nil))
+r.NotFound(httpx.NotFound)
+r.MethodNotAllowed(httpx.MethodNotAllowed)
+```
 
 ## report
 
@@ -383,6 +417,14 @@ on `server.Requests()` (decoded body, headers). `NewStatusServer` and
 
 Minor releases. The adapters need the root at `v0.2.0`, so this is a full
 release (see [Releasing](#releasing)).
+
+- Added `httpx`, the net/http toolkit for services on chi: `ClientIP`,
+  `Recover`, `SecurityHeaders`, `MaxBody`, `Unless`, `SkipPaths` and the
+  answer helpers. Lifted from systicore_reports_backend; the bodies are
+  the Fiber ones, except that a panic's 500 now reads
+  `{"error":"Internal Server Error"}` in every service (it was
+  "internal server error" in three of them and "Internal server error"
+  in the fourth). `Recover` gained `OnPanic` for an error reporter.
 
 - Added `logging.AccessLevel` and `logging.IsProbePath`. `Middleware`,
   `fiberv3.Logging` and `fiberv2.Logging` write the access line of a probe
