@@ -57,3 +57,35 @@ func TestLoggingScopesContextLoggerAndEchoesRequestID(t *testing.T) {
 		t.Errorf("access line = %v", got[1])
 	}
 }
+
+func TestLoggingWritesSuccessfulProbesAtDebug(t *testing.T) {
+	cases := []struct {
+		path   string
+		status int
+		want   string
+	}{
+		{"/health", fiber.StatusOK, "debug"},
+		{"/health/ready", fiber.StatusServiceUnavailable, "info"},
+		{"/reports", fiber.StatusOK, "info"},
+	}
+	for _, tc := range cases {
+		var buf bytes.Buffer
+		app := fiber.New()
+		app.Use(Logging(zerolog.New(&buf)))
+		app.Get(tc.path, func(c fiber.Ctx) error { return c.SendStatus(tc.status) })
+
+		resp, err := app.Test(httptest.NewRequest(http.MethodGet, tc.path, nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+
+		var line map[string]any
+		if err := json.Unmarshal(bytes.TrimSpace(buf.Bytes()), &line); err != nil {
+			t.Fatalf("%s: want exactly one JSON access line, got %q", tc.path, buf.String())
+		}
+		if line["message"] != "request" || line["level"] != tc.want || line["status"] != float64(tc.status) {
+			t.Errorf("%s %d: access line = %v, want level %s", tc.path, tc.status, line, tc.want)
+		}
+	}
+}

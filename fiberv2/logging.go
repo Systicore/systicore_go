@@ -45,8 +45,9 @@ func Logging(root zerolog.Logger) fiber.Handler {
 		start := time.Now()
 		err := c.Next()
 
-		l.Info().
-			Int("status", c.Response().StatusCode()).
+		status := c.Response().StatusCode()
+		l.WithLevel(logging.AccessLevel(c.Path(), status)).
+			Int("status", status).
 			Int("bytes", len(c.Response().Body())).
 			Dur("latency", time.Since(start)).
 			Msg("request")

@@ -119,3 +119,61 @@ func TestMiddlewareMintsRequestIDAndKeepsDefaultStatus(t *testing.T) {
 		t.Errorf("access line = %v", got)
 	}
 }
+
+func TestAccessLevel(t *testing.T) {
+	cases := []struct {
+		path   string
+		status int
+		want   zerolog.Level
+	}{
+		{"/health", http.StatusOK, zerolog.DebugLevel},
+		{"/health/live", http.StatusOK, zerolog.DebugLevel},
+		{"/health/ready", http.StatusOK, zerolog.DebugLevel},
+		{"/healthz", http.StatusNoContent, zerolog.DebugLevel},
+		{"/ready", http.StatusOK, zerolog.DebugLevel},
+		{"/metrics", http.StatusOK, zerolog.DebugLevel},
+		// A failing probe is the line someone will look for.
+		{"/health/ready", http.StatusServiceUnavailable, zerolog.InfoLevel},
+		{"/metrics", http.StatusForbidden, zerolog.InfoLevel},
+		// Exact paths only: nothing that merely starts like a probe.
+		{"/healthcheck", http.StatusOK, zerolog.InfoLevel},
+		{"/health/", http.StatusOK, zerolog.InfoLevel},
+		{"/api/v1/report", http.StatusOK, zerolog.InfoLevel},
+	}
+	for _, tc := range cases {
+		if got := AccessLevel(tc.path, tc.status); got != tc.want {
+			t.Errorf("AccessLevel(%q, %d) = %s, want %s", tc.path, tc.status, got, tc.want)
+		}
+	}
+}
+
+func TestMiddlewareLogsSuccessfulProbesAtDebug(t *testing.T) {
+	cases := []struct {
+		path   string
+		status int
+		want   string
+	}{
+		{"/health", http.StatusOK, "debug"},
+		{"/health/ready", http.StatusServiceUnavailable, "info"},
+		{"/reports/7", http.StatusOK, "info"},
+	}
+	for _, tc := range cases {
+		var buf bytes.Buffer
+		handler := Middleware(rootTo(&buf))(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(tc.status)
+		}))
+		handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, tc.path, nil))
+		got := lines(t, &buf)
+		if len(got) != 1 || got[0]["message"] != "request" || got[0]["level"] != tc.want {
+			t.Errorf("%s %d: access line = %v, want level %s", tc.path, tc.status, got, tc.want)
+		}
+	}
+
+	// A root logger at info drops the successful probe's line entirely.
+	var buf bytes.Buffer
+	quiet := Middleware(rootTo(&buf).Level(zerolog.InfoLevel))(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	quiet.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/health", nil))
+	if buf.Len() != 0 {
+		t.Errorf("an info-level root must not log a successful probe: %s", buf.String())
+	}
+}

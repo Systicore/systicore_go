@@ -42,21 +42,22 @@ Three modules, three tag series, all semver:
 
 | Module | Released | Next (see [Changelog](#changelog)) |
 |---|---|---|
-| root | `v0.1.0` | no release pending |
-| fiberv3 | `fiberv3/v0.1.0` | `fiberv3/v0.2.0` |
-| fiberv2 | `fiberv2/v0.1.0` | `fiberv2/v0.2.0` |
+| root | `v0.1.0` | `v0.2.0` |
+| fiberv3 | `fiberv3/v0.2.0` | `fiberv3/v0.3.0` |
+| fiberv2 | `fiberv2/v0.2.0` | `fiberv2/v0.3.0` |
 
 Consumers, once published (see [Releasing](#releasing)):
 
 ```bash
-go get github.com/Systicore/systicore_go@v0.1.0
-go get github.com/Systicore/systicore_go/fiberv3@v0.2.0   # Fiber v3 services
-go get github.com/Systicore/systicore_go/fiberv2@v0.2.0   # Fiber v2 services
+go get github.com/Systicore/systicore_go@v0.2.0
+go get github.com/Systicore/systicore_go/fiberv3@v0.3.0   # Fiber v3 services
+go get github.com/Systicore/systicore_go/fiberv2@v0.3.0   # Fiber v2 services
 ```
 
-These are the versions this README documents. `WrittenServerErrors`
-needs the adapters at `v0.2.0` or later; everything else works from
-`v0.1.0`.
+These are the versions this README documents. Probe lines at debug
+(`logging.AccessLevel`) need the root at `v0.2.0` and the adapters at
+`v0.3.0`; `WrittenServerErrors` needs the adapters at `v0.2.0` or later;
+everything else works from `v0.1.0`.
 
 The module path is case-sensitive: `github.com/Systicore/...` with a
 capital S, in imports and in any `GOPRIVATE` pattern.
@@ -86,6 +87,14 @@ Every adapter does the same three things: request-scoped logger with
 caller or minted and echoed back, so one id follows a request across
 services. `logging.Enrich(ctx, fn)` adds fields in place (`user_id` after
 auth). No package-level `Info()`/`Fatal()`; tests pass `zerolog.Nop()`.
+
+The HTTP adapters write the `request` line at the level
+`logging.AccessLevel(path, status)` returns: debug for a probe that
+succeeded — `/health`, `/health/live`, `/health/ready`, `/healthz`,
+`/ready`, `/metrics` with a status under 400 — so orchestrator and
+Prometheus polling every few seconds does not bury real traffic, and info
+for everything else, a failing probe included. `logging.IsProbePath` is
+the same set, for a service that wants it elsewhere (rate-limit skips).
 
 ## report
 
@@ -370,7 +379,22 @@ on `server.Requests()` (decoded body, headers). `NewStatusServer` and
 
 ## Changelog
 
-### fiberv3/v0.2.0, fiberv2/v0.2.0 — unreleased
+### v0.2.0, fiberv3/v0.3.0, fiberv2/v0.3.0 — unreleased
+
+Minor releases. The adapters need the root at `v0.2.0`, so this is a full
+release (see [Releasing](#releasing)).
+
+- Added `logging.AccessLevel` and `logging.IsProbePath`. `Middleware`,
+  `fiberv3.Logging` and `fiberv2.Logging` write the access line of a probe
+  that succeeded at debug instead of info; a failing probe stays at info.
+  A service logging at info no longer prints its health checks and
+  scrapes; at debug they are back. Taken from systicore_reports_backend,
+  which carried it in its copy of `logging` with a shorter path list.
+- Root, tests only: the fake ingest keys are built at runtime from
+  repeated characters, so secret scanners have no key-shaped
+  high-entropy literal to flag.
+
+### fiberv3/v0.2.0, fiberv2/v0.2.0 — 2026-09-25
 
 Minor releases: new API, nothing existing changes behaviour. Both still
 require the root at `v0.1.0`.
@@ -392,12 +416,6 @@ require the root at `v0.1.0`.
 - `ErrorHandler`, `RecoverConfig` and `ReportOptions.User` behave as in
   v0.1.0; they now share the "already reported" mark with the new
   middleware.
-
-### systicore_go (root) — no release
-
-Since `v0.1.0` only the tests changed: the fake ingest keys are built at
-runtime from repeated characters, so secret scanners have no key-shaped
-high-entropy literal to flag.
 
 ### v0.1.0, fiberv3/v0.1.0, fiberv2/v0.1.0
 
@@ -437,14 +455,20 @@ it through the module proxy and the order matters:
 
 A release that changes only an adapter skips steps 1 and 2.
 
-The pending release is of that kind: `fiberv3/v0.2.0` and
-`fiberv2/v0.2.0` use only root API that `v0.1.0` already has, and the
-root's own changes since `v0.1.0` are test-only, so no root tag and no
-`require` bump are needed:
+The pending release is the full kind: the adapters call
+`logging.AccessLevel`, which only the root at `v0.2.0` has. Until their
+`require` is bumped, `GOWORK=off go build` in an adapter fails with
+`undefined: logging.AccessLevel`, while CI, which builds inside the
+workspace, stays green — so all four steps, in order:
 
 ```bash
-git tag fiberv3/v0.2.0 && git tag fiberv2/v0.2.0
-git push origin fiberv3/v0.2.0 fiberv2/v0.2.0
-GOWORK=off go list -m github.com/Systicore/systicore_go/fiberv3@v0.2.0 \
-    github.com/Systicore/systicore_go/fiberv2@v0.2.0
+git tag v0.2.0 && git push origin v0.2.0
+(cd fiberv3 && GOWORK=off go get github.com/Systicore/systicore_go@v0.2.0 && GOWORK=off go mod tidy && GOWORK=off go test ./...)
+(cd fiberv2 && GOWORK=off go get github.com/Systicore/systicore_go@v0.2.0 && GOWORK=off go mod tidy && GOWORK=off go test ./...)
+git commit -am "fiberv2, fiberv3: require systicore_go v0.2.0" && git push
+git tag fiberv3/v0.3.0 && git tag fiberv2/v0.3.0
+git push origin fiberv3/v0.3.0 fiberv2/v0.3.0
+GOWORK=off go list -m github.com/Systicore/systicore_go@v0.2.0 \
+    github.com/Systicore/systicore_go/fiberv3@v0.3.0 \
+    github.com/Systicore/systicore_go/fiberv2@v0.3.0
 ```
