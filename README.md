@@ -10,6 +10,7 @@ systicore_go/                  module github.com/Systicore/systicore_go       �
 ├── logging/                   New, Options, context helpers, Middleware (net/http)
 ├── logging/grpclog/           gRPC interceptors (compiled only when imported)
 ├── httpx/                     net/http toolkit: responses, client IP, recover, security headers, body limit
+├── authn/                     users against the Systicore authenticator: JWT, permissions, CSRF (compiled only when imported)
 ├── report/                    client of the systicore_reports backend (error reports from services)
 ├── report/reporttest/         fake ingest endpoint for tests
 ├── fiberv3/                   module github.com/Systicore/systicore_go/fiberv3  ← Fiber v3 adapters
@@ -129,6 +130,47 @@ r.Use(httpx.MaxBody(cfg.Server.BodyLimit, nil))
 r.NotFound(httpx.NotFound)
 r.MethodNotAllowed(httpx.MethodNotAllowed)
 ```
+
+## authn
+
+Authenticates a request against the Systicore authenticator — the code
+each of the four backends kept a copy of, with the answers they all gave
+(`{"error":"invalid or expired token"}` and the rest, byte for byte: the
+web client keys its "session expired" handling on them). A package, not a
+module: jwt, keyfunc and singleflight are compiled only where it is
+imported.
+
+```go
+keys, err := authn.FetchJWKS(appCtx, cfg.Auth.IssuerURL+"/api/v1/oauth/jwks", 15*time.Second)
+// development may boot on without it: every token then gets a 401
+verifier := authn.NewVerifier(authn.VerifierOptions{Keyfunc: keys, Issuer: cfg.Auth.IssuerURL})
+
+r.Route("/api/v1", func(v1 chi.Router) {
+    v1.Use(authn.CSRF(authn.CSRFOptions{Secure: …, SameSite: …, Domain: ".systicore.hu"}))
+    v1.Use(authn.Authenticate(authn.AuthOptions{Verifier: verifier, CookieName: cfg.Auth.SessionCookieName, DevFallback: cfg.IsDevelopment()}))
+    v1.Use(authn.ResolvePermissions(authn.PermissionOptions{Source: authn.UserInfo(cfg.Auth.IssuerURL, nil), Cache: appCache}))
+    v1.With(authn.RequirePermission("systicore.reports.read")).Get("/admin/reports", h.List)
+})
+```
+
+- `FetchJWKS(ctx, url, timeout)`: `ctx` is the server's lifetime, it ends
+  the background refresh. Pass the context main cancels on shutdown, not a
+  boot timeout: that stops the refresh seconds after start, and a key the
+  authenticator withdraws stays trusted until the next restart. `timeout`
+  bounds the first fetch and each refresh.
+- `Verifier`: RS256/ES256, the pinned issuer (required), the audience when
+  set, an expiry in the future. The username comes from
+  `preferred_username`, the claim the authenticator issues.
+- `Authenticate`: the user goes into the context (`PrincipalFrom`,
+  `UserIDFrom`) and `user_id` onto the request logger. `DevFallback` runs
+  a token-less request as user 1 — development only.
+- `ResolvePermissions`: `UserInfo` asks `GET /api/v1/user` with the
+  caller's own credential; the authenticator plugs in its store with
+  `PermissionSourceFunc` and no cache. Concurrent requests of one user
+  share a lookup. **A failed lookup answers 503 at `RequirePermission`**,
+  not a 403 that blames the user for an outage.
+- `CSRF`: the double-submit cookie; a Bearer request skips it. Mount it
+  before `Authenticate`, so a forged request gets the 403 and not a 401.
 
 ## report
 
@@ -418,6 +460,15 @@ on `server.Requests()` (decoded body, headers). `NewStatusServer` and
 Minor releases. The adapters need the root at `v0.2.0`, so this is a full
 release (see [Releasing](#releasing)).
 
+- Added `authn`: access-token verification (`FetchJWKS`, `Verifier`),
+  `Authenticate`, `ResolvePermissions` with `UserInfo`, `RequirePermission`,
+  `CSRF`. Lifted from the four backends' copies, with their answers. It
+  pins the issuer on every token (one copy did not), answers 503 instead
+  of 403 when the permission lookup fails (one copy did, three did not),
+  reads the username from `preferred_username` (three copies read a
+  `username` claim the authenticator never issues), and keeps the JWKS
+  refresh alive for the server's lifetime (three copies stopped it 15
+  seconds after boot).
 - Added `httpx`, the net/http toolkit for services on chi: `ClientIP`,
   `Recover`, `SecurityHeaders`, `MaxBody`, `Unless`, `SkipPaths` and the
   answer helpers. Lifted from systicore_reports_backend; the bodies are
@@ -425,7 +476,6 @@ release (see [Releasing](#releasing)).
   `{"error":"Internal Server Error"}` in every service (it was
   "internal server error" in three of them and "Internal server error"
   in the fourth). `Recover` gained `OnPanic` for an error reporter.
-
 - Added `logging.AccessLevel` and `logging.IsProbePath`. `Middleware`,
   `fiberv3.Logging` and `fiberv2.Logging` write the access line of a probe
   that succeeded at debug instead of info; a failing probe stays at info.
