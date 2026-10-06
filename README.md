@@ -11,6 +11,8 @@ systicore_go/                  module github.com/Systicore/systicore_go       �
 ├── logging/grpclog/           gRPC interceptors (compiled only when imported)
 ├── httpx/                     net/http toolkit: responses, client IP, recover, security headers, body limit
 ├── authn/                     users against the Systicore authenticator: JWT, permissions, CSRF (compiled only when imported)
+├── serviceauth/               service-to-service: client_credentials token source, HTTP check
+├── serviceauth/grpcauth/      the same for gRPC: server interceptors, per-RPC credentials
 ├── report/                    client of the systicore_reports backend (error reports from services)
 ├── report/reporttest/         fake ingest endpoint for tests
 ├── fiberv3/                   module github.com/Systicore/systicore_go/fiberv3  ← Fiber v3 adapters
@@ -171,6 +173,61 @@ r.Route("/api/v1", func(v1 chi.Router) {
   not a 403 that blames the user for an outage.
 - `CSRF`: the double-submit cookie; a Bearer request skips it. Mount it
   before `Authenticate`, so a forged request gets the 403 and not a 401.
+
+## serviceauth
+
+Service-to-service calls between the Systicore backends, with the
+authenticator's `client_credentials` tokens (`sub` = `client:<id>`, a
+`scope`). The serving side admits a call only with a valid service token
+of the pinned issuer, the scope the route or RPC needs, and a client id on
+its allowlist — `SERVICE_ALLOWED_CLIENT_IDS`, where an empty list refuses
+everybody. The audience is not checked: the authenticator puts the
+calling client's id there, so one token goes to several services.
+
+```go
+// calling side: one token for every scope this service uses
+tokens := serviceauth.NewTokenSource(serviceauth.ClientOptions{
+    IssuerURL: cfg.Auth.IssuerURL, ClientID: cfg.Svc.ClientID, ClientSecret: cfg.Svc.ClientSecret,
+    Scopes: []string{"svc.push.send"},
+})
+conn, err := grpc.NewClient(cfg.Core.GRPCAddr,
+    grpc.WithTransportCredentials(insecure.NewCredentials()), // internal_net, see systicore_proto
+    grpc.WithPerRPCCredentials(grpcauth.Credentials(tokens)),
+    grpc.WithChainUnaryInterceptor(grpclog.UnaryClientInterceptor()))
+
+// serving side
+opts := serviceauth.Options{
+    Validator:      serviceauth.NewValidator(keys, cfg.Auth.IssuerURL), // keys: authn.FetchJWKS
+    AllowedClients: cfg.Service.AllowedClientIDs,
+    DevBypass:      cfg.IsDevelopment(),
+}
+r.With(serviceauth.Require(opts, "svc.push.send")).Post("/internal/v1/push", h.Send) // HTTP
+
+grpcOpts := grpcauth.ServerOptions{
+    Options: opts,
+    Scopes:  map[string]string{corev1.PushService_Send_FullMethodName: "svc.push.send"},
+    Open:    []string{grpc_health_v1.Health_Check_FullMethodName},
+}
+srv := grpc.NewServer(
+    grpc.ChainUnaryInterceptor(grpclog.UnaryServerInterceptor(root), grpcauth.UnaryServerInterceptor(grpcOpts)),
+    grpc.ChainStreamInterceptor(grpcauth.StreamServerInterceptor(grpcOpts)))
+```
+
+- `TokenSource.Token` caches the token until a minute before it expires;
+  concurrent callers share one token request. No `ClientID` returns `""`,
+  the development bypass: the call goes out without a token, and a server
+  with `DevBypass` admits it as `dev-bypass`. A token that is sent is
+  always checked in full.
+- `Require` reads the `Authorization` header only — never the session
+  cookie, so a browser session cannot pass as a service — and answers what
+  the `/internal/v1` routes always did: 401 `unauthorized`, 403 `forbidden`.
+- `grpcauth` refuses an RPC that is in neither `Scopes` nor `Open`, so an
+  RPC added without deciding who may call it stays closed — under
+  `DevBypass` too. Chain the stream interceptor even with unary RPCs only.
+  A token that cannot be had fails the call with `UNAVAILABLE`, which the
+  outbox callers retry.
+- The caller is in the context (`serviceauth.CallerFrom`) and its
+  `client_id` on the request logger.
 
 ## report
 
@@ -469,6 +526,12 @@ release (see [Releasing](#releasing)).
   `username` claim the authenticator never issues), and keeps the JWKS
   refresh alive for the server's lifetime (three copies stopped it 15
   seconds after boot).
+- Added `serviceauth` and `serviceauth/grpcauth`: the client_credentials
+  `TokenSource` the reports and projects backends kept identical copies
+  of, the HTTP check core and projects kept identical copies of, and the
+  gRPC interceptors systicore_proto's README already pointed here for.
+  The issuer is pinned on every service token (the copies pinned it only
+  when configured).
 - Added `httpx`, the net/http toolkit for services on chi: `ClientIP`,
   `Recover`, `SecurityHeaders`, `MaxBody`, `Unless`, `SkipPaths` and the
   answer helpers. Lifted from systicore_reports_backend; the bodies are
