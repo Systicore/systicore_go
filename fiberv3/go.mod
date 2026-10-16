@@ -1,6 +1,6 @@
 module github.com/Systicore/systicore_go/fiberv3
 
-go 1.26
+go 1.26.0
 
 // Own module so the root stays framework-free and fiber v3's fasthttp pin
 // never leaks into chi / net/http consumers.
