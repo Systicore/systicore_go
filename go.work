@@ -1,7 +1,7 @@
 // Local development only: lets the adapter modules build against this
 // checkout of the root. Consumers never see it — they get the tagged
 // modules from the proxy.
-go 1.26
+go 1.26.0
 
 use (
 	.
