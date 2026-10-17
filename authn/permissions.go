@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -95,13 +96,25 @@ type PermissionOptions struct {
 	Cache  Cache
 	MaxTTL time.Duration // 0 means 5 minutes
 	Buffer time.Duration // 0 means 30 seconds
+	// IgnoreTokenPermissions makes every request ask Source, even when
+	// the token carries a permissions claim. Off by default: the claim is
+	// how an OAuth client's token gets permissions at all, since
+	// GET /api/v1/user accepts first-party session tokens only.
+	IgnoreTokenPermissions bool
 }
 
 const permissionsCachePrefix = "user_perms:"
 
 // ResolvePermissions loads the caller's permission set into the context,
 // for RequirePermission and HasPermission. Mount it after Authenticate.
-// Concurrent requests of one user share a single lookup.
+//
+// A token with a permissions claim (Principal.TokenPermissions) gets
+// exactly that set: no lookup, no cache, and an empty claim is an empty
+// set, not a reason to ask Source. The claim lists only the issuing
+// client's namespaces, so a route checking a permission outside them
+// answers 403 for such a token, whatever the user holds elsewhere.
+// Without the claim, Source is asked, through the cache; concurrent
+// requests of one user share a single lookup.
 //
 // A lookup that fails leaves the set empty and marks the request, and
 // RequirePermission then answers 503: an outage of the authenticator is
@@ -127,6 +140,12 @@ func ResolvePermissions(o PermissionOptions) httpx.Middleware {
 			}
 			if p.DevFallback { // Authenticate already seeded the empty set
 				next.ServeHTTP(w, r)
+				return
+			}
+			if p.TokenPermissions.Present && !o.IgnoreTokenPermissions {
+				// Cloned, so a handler that appends to its set cannot
+				// write into the Principal's.
+				next.ServeHTTP(w, r.WithContext(WithPermissions(r.Context(), slices.Clone(p.TokenPermissions.Values))))
 				return
 			}
 			credential, _ := credentialFrom(r.Context())

@@ -171,6 +171,20 @@ r.Route("/api/v1", func(v1 chi.Router) {
   `PermissionSourceFunc` and no cache. Concurrent requests of one user
   share a lookup. **A failed lookup answers 503 at `RequirePermission`**,
   not a 403 that blames the user for an outage.
+- **A token with a `permissions` claim is its own permission set.** The
+  authenticator puts the claim into the access tokens of an OAuth client
+  that has permission prefixes configured (the mobile app's
+  `systicore_mobile`), because `GET /api/v1/user` accepts first-party
+  session tokens only. `Verify` reads it into `Claims.Permissions` and
+  `Authenticate` into `Principal.TokenPermissions`; `ResolvePermissions`
+  then uses it as is — no userinfo call, no cache — and `[]` is an empty
+  set, not a reason to ask `Source`. The claim lists only the client's
+  namespaces, so a route checking a permission outside them answers 403
+  to that token. A claim that is not an array of non-empty strings makes
+  the token invalid (401, `ErrMalformedPermissions`). Tokens without the
+  claim take the userinfo path exactly as before.
+  `PermissionOptions.IgnoreTokenPermissions` (default off) asks `Source`
+  for every token instead.
 - `CSRF`: the double-submit cookie; a Bearer request skips it. Mount it
   before `Authenticate`, so a forged request gets the 403 and not a 401.
 
@@ -526,6 +540,14 @@ release (see [Releasing](#releasing)).
   `username` claim the authenticator never issues), and keeps the JWKS
   refresh alive for the server's lifetime (three copies stopped it 15
   seconds after boot).
+- `authn` reads the access token's `permissions` claim, which the
+  authenticator writes for OAuth clients with permission prefixes: when
+  present, `ResolvePermissions` takes it as the whole set, without the
+  userinfo call that rejects those tokens, and `[]` means none.
+  Without the claim nothing changes. A malformed claim is an invalid
+  token. New: `Claims.Permissions`, `Principal.TokenPermissions`,
+  `PermissionsClaim`, `ErrMalformedPermissions`,
+  `PermissionOptions.IgnoreTokenPermissions`.
 - Added `serviceauth` and `serviceauth/grpcauth`: the client_credentials
   `TokenSource` the reports and projects backends kept identical copies
   of, the HTTP check core and projects kept identical copies of, and the
