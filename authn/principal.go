@@ -15,6 +15,11 @@ type Principal struct {
 	// TokenExp is the access token's expiry; the permission cache never
 	// outlives it. Zero when unknown.
 	TokenExp time.Time
+	// TokenPermissions is the access token's permissions claim. An OAuth
+	// client's token carries it, scoped to that client's namespaces;
+	// ResolvePermissions then takes it as the caller's whole permission
+	// set. First-party session tokens never carry it (Present false).
+	TokenPermissions PermissionsClaim
 	// DevFallback marks the development user Authenticate installs for a
 	// request without a token (AuthOptions.DevFallback).
 	DevFallback bool
