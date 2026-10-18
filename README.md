@@ -9,6 +9,10 @@ blacklab, bliss, biharvideke, mymosaiq, … — whatever HTTP stack they run.
 systicore_go/                  module github.com/Systicore/systicore_go       ← core: stdlib + zerolog only
 ├── logging/                   New, Options, context helpers, Middleware (net/http)
 ├── logging/grpclog/           gRPC interceptors (compiled only when imported)
+├── httpx/                     net/http toolkit: responses, client IP, recover, security headers, body limit
+├── authn/                     users against the Systicore authenticator: JWT, permissions, CSRF (compiled only when imported)
+├── serviceauth/               service-to-service: client_credentials token source, HTTP check
+├── serviceauth/grpcauth/      the same for gRPC: server interceptors, per-RPC credentials
 ├── report/                    client of the systicore_reports backend (error reports from services)
 ├── report/reporttest/         fake ingest endpoint for tests
 ├── fiberv3/                   module github.com/Systicore/systicore_go/fiberv3  ← Fiber v3 adapters
@@ -42,21 +46,22 @@ Three modules, three tag series, all semver:
 
 | Module | Released | Next (see [Changelog](#changelog)) |
 |---|---|---|
-| root | `v0.1.0` | no release pending |
-| fiberv3 | `fiberv3/v0.1.0` | `fiberv3/v0.2.0` |
-| fiberv2 | `fiberv2/v0.1.0` | `fiberv2/v0.2.0` |
+| root | `v0.1.0` | `v0.2.0` |
+| fiberv3 | `fiberv3/v0.2.0` | `fiberv3/v0.3.0` |
+| fiberv2 | `fiberv2/v0.2.0` | `fiberv2/v0.3.0` |
 
 Consumers, once published (see [Releasing](#releasing)):
 
 ```bash
-go get github.com/Systicore/systicore_go@v0.1.0
-go get github.com/Systicore/systicore_go/fiberv3@v0.2.0   # Fiber v3 services
-go get github.com/Systicore/systicore_go/fiberv2@v0.2.0   # Fiber v2 services
+go get github.com/Systicore/systicore_go@v0.2.0
+go get github.com/Systicore/systicore_go/fiberv3@v0.3.0   # Fiber v3 services
+go get github.com/Systicore/systicore_go/fiberv2@v0.3.0   # Fiber v2 services
 ```
 
-These are the versions this README documents. `WrittenServerErrors`
-needs the adapters at `v0.2.0` or later; everything else works from
-`v0.1.0`.
+These are the versions this README documents. Probe lines at debug
+(`logging.AccessLevel`) need the root at `v0.2.0` and the adapters at
+`v0.3.0`; `WrittenServerErrors` needs the adapters at `v0.2.0` or later;
+everything else works from `v0.1.0`.
 
 The module path is case-sensitive: `github.com/Systicore/...` with a
 capital S, in imports and in any `GOPRIVATE` pattern.
@@ -86,6 +91,157 @@ Every adapter does the same three things: request-scoped logger with
 caller or minted and echoed back, so one id follows a request across
 services. `logging.Enrich(ctx, fn)` adds fields in place (`user_id` after
 auth). No package-level `Info()`/`Fatal()`; tests pass `zerolog.Nop()`.
+
+The HTTP adapters write the `request` line at the level
+`logging.AccessLevel(path, status)` returns: debug for a probe that
+succeeded — `/health`, `/health/live`, `/health/ready`, `/healthz`,
+`/ready`, `/metrics` with a status under 400 — so orchestrator and
+Prometheus polling every few seconds does not bury real traffic, and info
+for everything else, a failing probe included. `logging.IsProbePath` is
+the same set, for a service that wants it elsewhere (rate-limit skips).
+
+## httpx
+
+The net/http toolkit for a service on chi (or any router taking
+`func(http.Handler) http.Handler`). Lifted from systicore_reports_backend,
+the first Systicore backend on chi, so the answers are still the ones the
+Fiber services gave: a framework error is `{"error": <status text>}`, a
+route nothing matches `{"error": "Cannot GET /path"}`.
+
+| | |
+|---|---|
+| `ClientIP(ClientIPOptions)` | rewrites `r.RemoteAddr` to the bare client IP; `X-Forwarded-For` only from trusted proxies, walked from the nearest hop, so a forged leftmost entry is ignored. Mount it first |
+| `Recover(RecoverOptions)` | panic → 500 and an error line on the request logger; `Stack` for development, `OnPanic` to hand it to an error reporter. After `logging.Middleware` |
+| `SecurityHeaders(SecurityHeadersOptions)` | Fiber helmet's defaults written out; options for CORP, `X-Frame-Options`, CSP, HSTS |
+| `MaxBody(max, reject)` | 413 up front for a declared length over the cap, `http.MaxBytesReader` for the rest |
+| `Unless(skip, mw)`, `SkipPaths(mw, paths...)` | keep one middleware off some requests (probes, the Swagger UI) |
+| `JSON`, `Error`, `StatusError`, `NotFound`, `MethodNotAllowed`, `DecodeJSON` | answers and body decoding; `DecodeJSON` returns `ErrBodyTooLarge` past the `MaxBody` cap |
+| `IP(r)`, `ResponseRecorder` | the client address without a port; status and byte count for middleware that needs them |
+
+The order the reports backend runs, and the one to copy:
+
+```go
+r := chi.NewRouter()
+r.Use(httpx.ClientIP(proxyOptions))
+r.Use(logging.Middleware(root))
+r.Use(httpx.Recover(httpx.RecoverOptions{Stack: cfg.IsDevelopment()}))
+r.Use(httpx.SecurityHeaders(httpx.SecurityHeadersOptions{CrossOriginResourcePolicy: "cross-origin"}))
+r.Use(chimiddleware.GetHead) // the Dockerfile healthcheck sends HEAD
+// CORS, rate limiter (httpx.SkipPaths for the probes), metrics …
+r.Use(httpx.MaxBody(cfg.Server.BodyLimit, nil))
+r.NotFound(httpx.NotFound)
+r.MethodNotAllowed(httpx.MethodNotAllowed)
+```
+
+## authn
+
+Authenticates a request against the Systicore authenticator — the code
+each of the four backends kept a copy of, with the answers they all gave
+(`{"error":"invalid or expired token"}` and the rest, byte for byte: the
+web client keys its "session expired" handling on them). A package, not a
+module: jwt, keyfunc and singleflight are compiled only where it is
+imported.
+
+```go
+keys, err := authn.FetchJWKS(appCtx, cfg.Auth.IssuerURL+"/api/v1/oauth/jwks", 15*time.Second)
+// development may boot on without it: every token then gets a 401
+verifier := authn.NewVerifier(authn.VerifierOptions{Keyfunc: keys, Issuer: cfg.Auth.IssuerURL})
+
+r.Route("/api/v1", func(v1 chi.Router) {
+    v1.Use(authn.CSRF(authn.CSRFOptions{Secure: …, SameSite: …, Domain: ".systicore.hu"}))
+    v1.Use(authn.Authenticate(authn.AuthOptions{Verifier: verifier, CookieName: cfg.Auth.SessionCookieName, DevFallback: cfg.IsDevelopment()}))
+    v1.Use(authn.ResolvePermissions(authn.PermissionOptions{Source: authn.UserInfo(cfg.Auth.IssuerURL, nil), Cache: appCache}))
+    v1.With(authn.RequirePermission("systicore.reports.read")).Get("/admin/reports", h.List)
+})
+```
+
+- `FetchJWKS(ctx, url, timeout)`: `ctx` is the server's lifetime, it ends
+  the background refresh. Pass the context main cancels on shutdown, not a
+  boot timeout: that stops the refresh seconds after start, and a key the
+  authenticator withdraws stays trusted until the next restart. `timeout`
+  bounds the first fetch and each refresh.
+- `Verifier`: RS256/ES256, the pinned issuer (required), the audience when
+  set, an expiry in the future. The username comes from
+  `preferred_username`, the claim the authenticator issues.
+- `Authenticate`: the user goes into the context (`PrincipalFrom`,
+  `UserIDFrom`) and `user_id` onto the request logger. `DevFallback` runs
+  a token-less request as user 1 — development only.
+- `ResolvePermissions`: `UserInfo` asks `GET /api/v1/user` with the
+  caller's own credential; the authenticator plugs in its store with
+  `PermissionSourceFunc` and no cache. Concurrent requests of one user
+  share a lookup. **A failed lookup answers 503 at `RequirePermission`**,
+  not a 403 that blames the user for an outage.
+- **A token with a `permissions` claim is its own permission set.** The
+  authenticator puts the claim into the access tokens of an OAuth client
+  that has permission prefixes configured (the mobile app's
+  `systicore_mobile`), because `GET /api/v1/user` accepts first-party
+  session tokens only. `Verify` reads it into `Claims.Permissions` and
+  `Authenticate` into `Principal.TokenPermissions`; `ResolvePermissions`
+  then uses it as is — no userinfo call, no cache — and `[]` is an empty
+  set, not a reason to ask `Source`. The claim lists only the client's
+  namespaces, so a route checking a permission outside them answers 403
+  to that token. A claim that is not an array of non-empty strings makes
+  the token invalid (401, `ErrMalformedPermissions`). Tokens without the
+  claim take the userinfo path exactly as before.
+  `PermissionOptions.IgnoreTokenPermissions` (default off) asks `Source`
+  for every token instead.
+- `CSRF`: the double-submit cookie; a Bearer request skips it. Mount it
+  before `Authenticate`, so a forged request gets the 403 and not a 401.
+
+## serviceauth
+
+Service-to-service calls between the Systicore backends, with the
+authenticator's `client_credentials` tokens (`sub` = `client:<id>`, a
+`scope`). The serving side admits a call only with a valid service token
+of the pinned issuer, the scope the route or RPC needs, and a client id on
+its allowlist — `SERVICE_ALLOWED_CLIENT_IDS`, where an empty list refuses
+everybody. The audience is not checked: the authenticator puts the
+calling client's id there, so one token goes to several services.
+
+```go
+// calling side: one token for every scope this service uses
+tokens := serviceauth.NewTokenSource(serviceauth.ClientOptions{
+    IssuerURL: cfg.Auth.IssuerURL, ClientID: cfg.Svc.ClientID, ClientSecret: cfg.Svc.ClientSecret,
+    Scopes: []string{"svc.push.send"},
+})
+conn, err := grpc.NewClient(cfg.Core.GRPCAddr,
+    grpc.WithTransportCredentials(insecure.NewCredentials()), // internal_net, see systicore_proto
+    grpc.WithPerRPCCredentials(grpcauth.Credentials(tokens)),
+    grpc.WithChainUnaryInterceptor(grpclog.UnaryClientInterceptor()))
+
+// serving side
+opts := serviceauth.Options{
+    Validator:      serviceauth.NewValidator(keys, cfg.Auth.IssuerURL), // keys: authn.FetchJWKS
+    AllowedClients: cfg.Service.AllowedClientIDs,
+    DevBypass:      cfg.IsDevelopment(),
+}
+r.With(serviceauth.Require(opts, "svc.push.send")).Post("/internal/v1/push", h.Send) // HTTP
+
+grpcOpts := grpcauth.ServerOptions{
+    Options: opts,
+    Scopes:  map[string]string{corev1.PushService_Send_FullMethodName: "svc.push.send"},
+    Open:    []string{grpc_health_v1.Health_Check_FullMethodName},
+}
+srv := grpc.NewServer(
+    grpc.ChainUnaryInterceptor(grpclog.UnaryServerInterceptor(root), grpcauth.UnaryServerInterceptor(grpcOpts)),
+    grpc.ChainStreamInterceptor(grpcauth.StreamServerInterceptor(grpcOpts)))
+```
+
+- `TokenSource.Token` caches the token until a minute before it expires;
+  concurrent callers share one token request. No `ClientID` returns `""`,
+  the development bypass: the call goes out without a token, and a server
+  with `DevBypass` admits it as `dev-bypass`. A token that is sent is
+  always checked in full.
+- `Require` reads the `Authorization` header only — never the session
+  cookie, so a browser session cannot pass as a service — and answers what
+  the `/internal/v1` routes always did: 401 `unauthorized`, 403 `forbidden`.
+- `grpcauth` refuses an RPC that is in neither `Scopes` nor `Open`, so an
+  RPC added without deciding who may call it stays closed — under
+  `DevBypass` too. Chain the stream interceptor even with unary RPCs only.
+  A token that cannot be had fails the call with `UNAVAILABLE`, which the
+  outbox callers retry.
+- The caller is in the context (`serviceauth.CallerFrom`) and its
+  `client_id` on the request logger.
 
 ## report
 
@@ -370,7 +526,52 @@ on `server.Requests()` (decoded body, headers). `NewStatusServer` and
 
 ## Changelog
 
-### fiberv3/v0.2.0, fiberv2/v0.2.0 — unreleased
+### v0.2.0, fiberv3/v0.3.0, fiberv2/v0.3.0 — unreleased
+
+Minor releases. The adapters need the root at `v0.2.0`, so this is a full
+release (see [Releasing](#releasing)).
+
+- Added `authn`: access-token verification (`FetchJWKS`, `Verifier`),
+  `Authenticate`, `ResolvePermissions` with `UserInfo`, `RequirePermission`,
+  `CSRF`. Lifted from the four backends' copies, with their answers. It
+  pins the issuer on every token (one copy did not), answers 503 instead
+  of 403 when the permission lookup fails (one copy did, three did not),
+  reads the username from `preferred_username` (three copies read a
+  `username` claim the authenticator never issues), and keeps the JWKS
+  refresh alive for the server's lifetime (three copies stopped it 15
+  seconds after boot).
+- `authn` reads the access token's `permissions` claim, which the
+  authenticator writes for OAuth clients with permission prefixes: when
+  present, `ResolvePermissions` takes it as the whole set, without the
+  userinfo call that rejects those tokens, and `[]` means none.
+  Without the claim nothing changes. A malformed claim is an invalid
+  token. New: `Claims.Permissions`, `Principal.TokenPermissions`,
+  `PermissionsClaim`, `ErrMalformedPermissions`,
+  `PermissionOptions.IgnoreTokenPermissions`.
+- Added `serviceauth` and `serviceauth/grpcauth`: the client_credentials
+  `TokenSource` the reports and projects backends kept identical copies
+  of, the HTTP check core and projects kept identical copies of, and the
+  gRPC interceptors systicore_proto's README already pointed here for.
+  The issuer is pinned on every service token (the copies pinned it only
+  when configured).
+- Added `httpx`, the net/http toolkit for services on chi: `ClientIP`,
+  `Recover`, `SecurityHeaders`, `MaxBody`, `Unless`, `SkipPaths` and the
+  answer helpers. Lifted from systicore_reports_backend; the bodies are
+  the Fiber ones, except that a panic's 500 now reads
+  `{"error":"Internal Server Error"}` in every service (it was
+  "internal server error" in three of them and "Internal server error"
+  in the fourth). `Recover` gained `OnPanic` for an error reporter.
+- Added `logging.AccessLevel` and `logging.IsProbePath`. `Middleware`,
+  `fiberv3.Logging` and `fiberv2.Logging` write the access line of a probe
+  that succeeded at debug instead of info; a failing probe stays at info.
+  A service logging at info no longer prints its health checks and
+  scrapes; at debug they are back. Taken from systicore_reports_backend,
+  which carried it in its copy of `logging` with a shorter path list.
+- Root, tests only: the fake ingest keys are built at runtime from
+  repeated characters, so secret scanners have no key-shaped
+  high-entropy literal to flag.
+
+### fiberv3/v0.2.0, fiberv2/v0.2.0 — 2026-09-25
 
 Minor releases: new API, nothing existing changes behaviour. Both still
 require the root at `v0.1.0`.
@@ -392,12 +593,6 @@ require the root at `v0.1.0`.
 - `ErrorHandler`, `RecoverConfig` and `ReportOptions.User` behave as in
   v0.1.0; they now share the "already reported" mark with the new
   middleware.
-
-### systicore_go (root) — no release
-
-Since `v0.1.0` only the tests changed: the fake ingest keys are built at
-runtime from repeated characters, so secret scanners have no key-shaped
-high-entropy literal to flag.
 
 ### v0.1.0, fiberv3/v0.1.0, fiberv2/v0.1.0
 
@@ -437,14 +632,20 @@ it through the module proxy and the order matters:
 
 A release that changes only an adapter skips steps 1 and 2.
 
-The pending release is of that kind: `fiberv3/v0.2.0` and
-`fiberv2/v0.2.0` use only root API that `v0.1.0` already has, and the
-root's own changes since `v0.1.0` are test-only, so no root tag and no
-`require` bump are needed:
+The pending release is the full kind: the adapters call
+`logging.AccessLevel`, which only the root at `v0.2.0` has. Until their
+`require` is bumped, `GOWORK=off go build` in an adapter fails with
+`undefined: logging.AccessLevel`, while CI, which builds inside the
+workspace, stays green — so all four steps, in order:
 
 ```bash
-git tag fiberv3/v0.2.0 && git tag fiberv2/v0.2.0
-git push origin fiberv3/v0.2.0 fiberv2/v0.2.0
-GOWORK=off go list -m github.com/Systicore/systicore_go/fiberv3@v0.2.0 \
-    github.com/Systicore/systicore_go/fiberv2@v0.2.0
+git tag v0.2.0 && git push origin v0.2.0
+(cd fiberv3 && GOWORK=off go get github.com/Systicore/systicore_go@v0.2.0 && GOWORK=off go mod tidy && GOWORK=off go test ./...)
+(cd fiberv2 && GOWORK=off go get github.com/Systicore/systicore_go@v0.2.0 && GOWORK=off go mod tidy && GOWORK=off go test ./...)
+git commit -am "fiberv2, fiberv3: require systicore_go v0.2.0" && git push
+git tag fiberv3/v0.3.0 && git tag fiberv2/v0.3.0
+git push origin fiberv3/v0.3.0 fiberv2/v0.3.0
+GOWORK=off go list -m github.com/Systicore/systicore_go@v0.2.0 \
+    github.com/Systicore/systicore_go/fiberv3@v0.3.0 \
+    github.com/Systicore/systicore_go/fiberv2@v0.3.0
 ```

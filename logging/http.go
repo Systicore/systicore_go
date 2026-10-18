@@ -42,7 +42,7 @@ func Middleware(root zerolog.Logger) func(http.Handler) http.Handler {
 			start := time.Now()
 			next.ServeHTTP(rec, r.WithContext(ctx))
 
-			l.Info().
+			l.WithLevel(AccessLevel(r.URL.Path, rec.status)).
 				Int("status", rec.status).
 				Int("bytes", rec.bytes).
 				Dur("latency", time.Since(start)).
