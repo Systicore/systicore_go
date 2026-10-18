@@ -76,7 +76,7 @@ func Authenticate(o AuthOptions) httpx.Middleware {
 				return
 			}
 
-			p := Principal{UserID: userID, Email: claims.Email, Username: claims.PreferredUsername, Name: claims.Name}
+			p := Principal{UserID: userID, Email: claims.Email, Username: claims.PreferredUsername, Name: claims.Name, TokenPermissions: claims.Permissions}
 			if claims.ExpiresAt != nil {
 				p.TokenExp = claims.ExpiresAt.Time
 			}

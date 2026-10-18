@@ -1,7 +1,9 @@
 package authn
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -31,7 +33,59 @@ type Claims struct {
 	Name              string `json:"name"`
 	Scope             string `json:"scope"`
 	ClientID          string `json:"client_id"`
+	// Permissions is the permissions claim the authenticator puts into
+	// the access tokens of an OAuth client that has permission prefixes
+	// configured. First-party session tokens never carry it.
+	Permissions PermissionsClaim `json:"permissions,omitzero"`
 	jwt.RegisteredClaims
+}
+
+// PermissionsClaim is the token's permissions claim: the user's
+// permissions within the issuing client's namespaces, as full permission
+// UIDs ("systicore.reports.read"). Present tells "no claim" (resolve
+// through the PermissionSource) from "an empty claim" (the user holds
+// none of the client's permissions; nothing else is asked).
+type PermissionsClaim struct {
+	Present bool
+	Values  []string
+}
+
+// ErrMalformedPermissions is why a token whose permissions claim is not
+// a JSON array of non-empty strings fails verification. Such a token is
+// invalid as a whole (401), not "a token without permissions": a claim
+// the authenticator did not write that way is not one to guess about.
+var ErrMalformedPermissions = errors.New("authn: permissions claim is not an array of non-empty strings")
+
+// UnmarshalJSON accepts an array of non-empty strings, and nothing else:
+// null, a string, an object, a number or a null or empty element is
+// ErrMalformedPermissions.
+func (p *PermissionsClaim) UnmarshalJSON(b []byte) error {
+	var raw []json.RawMessage
+	if bytes.Equal(bytes.TrimSpace(b), []byte("null")) || json.Unmarshal(b, &raw) != nil {
+		return ErrMalformedPermissions
+	}
+	values := make([]string, 0, len(raw))
+	for _, element := range raw {
+		var v string
+		if bytes.Equal(bytes.TrimSpace(element), []byte("null")) || json.Unmarshal(element, &v) != nil || v == "" {
+			return ErrMalformedPermissions
+		}
+		values = append(values, v)
+	}
+	*p = PermissionsClaim{Present: true, Values: values}
+	return nil
+}
+
+// IsZero reports an absent claim, so omitzero leaves it out of a token.
+func (p PermissionsClaim) IsZero() bool { return !p.Present }
+
+// MarshalJSON writes the claim as the array it came as; an absent one,
+// which omitzero leaves out of Claims, as null.
+func (p PermissionsClaim) MarshalJSON() ([]byte, error) {
+	if !p.Present {
+		return []byte("null"), nil
+	}
+	return json.Marshal(p.Values)
 }
 
 // VerifierOptions configure a Verifier.
