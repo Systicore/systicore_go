@@ -3,6 +3,7 @@
 package fiberv2
 
 import (
+	"errors"
 	"strings"
 	"time"
 
@@ -45,12 +46,37 @@ func Logging(root zerolog.Logger) fiber.Handler {
 		start := time.Now()
 		err := c.Next()
 
+		// A handler that returns an error has written nothing yet: Fiber
+		// runs the app ErrorHandler only after the whole chain, this
+		// middleware included, has returned. Logging StatusCode() here would
+		// record the unwritten default 200 for every failed request, so the
+		// status is the one the error handler will answer with instead, and
+		// there is no body to count.
 		status := c.Response().StatusCode()
-		l.WithLevel(logging.AccessLevel(c.Path(), status)).
-			Int("status", status).
-			Int("bytes", len(c.Response().Body())).
+		if err != nil {
+			status = errorStatus(err)
+		}
+		line := l.WithLevel(logging.AccessLevel(c.Path(), status)).
+			Int("status", status)
+		if err == nil {
+			line = line.Int("bytes", len(c.Response().Body()))
+		}
+		line.Err(err).
 			Dur("latency", time.Since(start)).
 			Msg("request")
 		return err
 	}
+}
+
+// errorStatus is the status Fiber's DefaultErrorHandler answers a returned
+// error with: the code of a (possibly wrapped) *fiber.Error, 500 for
+// anything else. An app whose own ErrorHandler maps errors differently
+// should keep that mapping to *fiber.Error, or the access line disagrees
+// with the response.
+func errorStatus(err error) int {
+	var fiberError *fiber.Error
+	if errors.As(err, &fiberError) {
+		return fiberError.Code
+	}
+	return fiber.StatusInternalServerError
 }

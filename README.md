@@ -46,21 +46,25 @@ Three modules, three tag series, all semver:
 
 | Module | Released | Next (see [Changelog](#changelog)) |
 |---|---|---|
-| root | `v0.1.0` | `v0.2.0` |
-| fiberv3 | `fiberv3/v0.2.0` | `fiberv3/v0.3.0` |
-| fiberv2 | `fiberv2/v0.2.0` | `fiberv2/v0.3.0` |
+| root | `v0.4.0` | — |
+| fiberv3 | `fiberv3/v0.4.0` | `fiberv3/v0.4.1` |
+| fiberv2 | `fiberv2/v0.4.0` | `fiberv2/v0.4.1` |
 
 Consumers, once published (see [Releasing](#releasing)):
 
 ```bash
-go get github.com/Systicore/systicore_go@v0.2.0
-go get github.com/Systicore/systicore_go/fiberv3@v0.3.0   # Fiber v3 services
-go get github.com/Systicore/systicore_go/fiberv2@v0.3.0   # Fiber v2 services
+go get github.com/Systicore/systicore_go@v0.4.0
+go get github.com/Systicore/systicore_go/fiberv3@v0.4.1   # Fiber v3 services
+go get github.com/Systicore/systicore_go/fiberv2@v0.4.1   # Fiber v2 services
 ```
 
-These are the versions this README documents. Probe lines at debug
-(`logging.AccessLevel`) need the root at `v0.2.0` and the adapters at
-`v0.3.0`; `WrittenServerErrors` needs the adapters at `v0.2.0` or later;
+These are the versions this README documents. Use the adapters at
+`v0.4.1` or later: `fiberv*/v0.3.0` and `fiberv*/v0.4.0` call
+`logging.AccessLevel` but require the root at `v0.1.0`, which lacks it,
+so they build only when the consumer itself requires the root at
+`v0.2.0` or later (see [Changelog](#changelog)). `authn`, `serviceauth`
+and `httpx` need the root at `v0.2.0`, the token `permissions` claim
+`v0.4.0`; `WrittenServerErrors` needs the adapters at `v0.2.0` or later;
 everything else works from `v0.1.0`.
 
 The module path is case-sensitive: `github.com/Systicore/...` with a
@@ -87,7 +91,10 @@ defer closeLog()
 
 Every adapter does the same three things: request-scoped logger with
 `request_id`, `method`, `path`, `ip` into the context; one `request` /
-`rpc` line with status, bytes, latency; `X-Request-ID` taken from the
+`rpc` line with status, bytes, latency — for a Fiber handler that returns
+an error, the status the error handler will answer with and the error
+itself (Fiber writes that answer only after the chain, so there is no
+body to count yet); `X-Request-ID` taken from the
 caller or minted and echoed back, so one id follows a request across
 services. `logging.Enrich(ctx, fn)` adds fields in place (`user_id` after
 auth). No package-level `Info()`/`Fatal()`; tests pass `zerolog.Nop()`.
@@ -526,10 +533,33 @@ on `server.Requests()` (decoded body, headers). `NewStatusServer` and
 
 ## Changelog
 
-### v0.2.0, fiberv3/v0.3.0, fiberv2/v0.3.0 — unreleased
+### fiberv3/v0.4.1, fiberv2/v0.4.1 — unreleased
 
-Minor releases. The adapters need the root at `v0.2.0`, so this is a full
-release (see [Releasing](#releasing)).
+Patch releases of the adapters only; the root stays at `v0.4.0`.
+
+- `Logging` records the status a client actually gets when a handler
+  returns an error. Fiber runs the app `ErrorHandler` only after the
+  whole chain has returned, so the access line read the unwritten
+  default and logged `"status":200` for every failed request — a 404, a
+  `fiber.NewError(503, …)`, a plain `error` answered with 500, an
+  unmatched route. The status now comes from the returned error the way
+  `fiber.DefaultErrorHandler` maps it (the code of a possibly wrapped
+  `*fiber.Error`, else 500), the line carries the error, and it leaves
+  out `bytes`, since the body is not written yet. An app whose own
+  `ErrorHandler` maps errors to other codes should keep that mapping to
+  `*fiber.Error`. Successful requests log exactly as before.
+- Both adapters require the root at `v0.4.0`. `fiberv*/v0.3.0` and
+  `fiberv*/v0.4.0` call `logging.AccessLevel` while requiring the root
+  at `v0.1.0`, which lacks it: they failed with
+  `undefined: logging.AccessLevel` for a consumer that did not require a
+  newer root itself. CI builds inside the workspace and did not notice.
+
+### v0.2.0 – v0.4.0, fiberv3/v0.3.0 – v0.4.0, fiberv2/v0.3.0 – v0.4.0 — 2026-10-19
+
+Minor releases. `v0.2.0`, `v0.3.0` and the adapters' `v0.3.0` tag the
+same commit; `v0.4.0` adds the token `permissions` claim to `authn`. The
+adapters' `require` was not bumped (step 2 of [Releasing](#releasing)),
+so use them at `v0.4.1`.
 
 - Added `authn`: access-token verification (`FetchJWKS`, `Verifier`),
   `Authenticate`, `ResolvePermissions` with `UserInfo`, `RequirePermission`,
@@ -632,20 +662,12 @@ it through the module proxy and the order matters:
 
 A release that changes only an adapter skips steps 1 and 2.
 
-The pending release is the full kind: the adapters call
-`logging.AccessLevel`, which only the root at `v0.2.0` has. Until their
-`require` is bumped, `GOWORK=off go build` in an adapter fails with
-`undefined: logging.AccessLevel`, while CI, which builds inside the
-workspace, stays green — so all four steps, in order:
+The pending release is adapter-only: both adapters already require the
+published root `v0.4.0`, so steps 3 and 4 on the merged commit:
 
 ```bash
-git tag v0.2.0 && git push origin v0.2.0
-(cd fiberv3 && GOWORK=off go get github.com/Systicore/systicore_go@v0.2.0 && GOWORK=off go mod tidy && GOWORK=off go test ./...)
-(cd fiberv2 && GOWORK=off go get github.com/Systicore/systicore_go@v0.2.0 && GOWORK=off go mod tidy && GOWORK=off go test ./...)
-git commit -am "fiberv2, fiberv3: require systicore_go v0.2.0" && git push
-git tag fiberv3/v0.3.0 && git tag fiberv2/v0.3.0
-git push origin fiberv3/v0.3.0 fiberv2/v0.3.0
-GOWORK=off go list -m github.com/Systicore/systicore_go@v0.2.0 \
-    github.com/Systicore/systicore_go/fiberv3@v0.3.0 \
-    github.com/Systicore/systicore_go/fiberv2@v0.3.0
+git tag fiberv3/v0.4.1 && git tag fiberv2/v0.4.1
+git push origin fiberv3/v0.4.1 fiberv2/v0.4.1
+GOWORK=off go list -m github.com/Systicore/systicore_go/fiberv3@v0.4.1 \
+    github.com/Systicore/systicore_go/fiberv2@v0.4.1
 ```

@@ -3,6 +3,8 @@ package fiberv2
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -78,6 +80,50 @@ func TestLoggingWritesSuccessfulProbesAtDebug(t *testing.T) {
 		}
 		if line["message"] != "request" || line["level"] != tc.want || line["status"] != float64(tc.status) {
 			t.Errorf("%s %d: access line = %v, want level %s", tc.path, tc.status, line, tc.want)
+		}
+	}
+}
+
+func TestLoggingRecordsTheStatusOfAReturnedError(t *testing.T) {
+	cases := []struct {
+		name, path string
+		handler    fiber.Handler
+		want       int
+	}{
+		{"fiber error", "/unavailable", func(*fiber.Ctx) error { return fiber.NewError(fiber.StatusServiceUnavailable, "down") }, fiber.StatusServiceUnavailable},
+		{"wrapped fiber error", "/gone", func(*fiber.Ctx) error { return fmt.Errorf("lookup: %w", fiber.ErrNotFound) }, fiber.StatusNotFound},
+		{"plain error", "/boom", func(*fiber.Ctx) error { return errors.New("boom") }, fiber.StatusInternalServerError},
+		{"unmatched route", "/nowhere", nil, fiber.StatusNotFound},
+	}
+	for _, tc := range cases {
+		var buf bytes.Buffer
+		app := fiber.New()
+		app.Use(Logging(zerolog.New(&buf)))
+		if tc.handler != nil {
+			app.Get(tc.path, tc.handler)
+		}
+
+		resp, err := app.Test(httptest.NewRequest(http.MethodGet, tc.path, nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != tc.want {
+			t.Fatalf("%s: response %d, want %d", tc.name, resp.StatusCode, tc.want)
+		}
+
+		var line map[string]any
+		if err := json.Unmarshal(bytes.TrimSpace(buf.Bytes()), &line); err != nil {
+			t.Fatalf("%s: want exactly one JSON access line, got %q", tc.name, buf.String())
+		}
+		if line["status"] != float64(tc.want) {
+			t.Errorf("%s: access line status = %v, want %d (what the client got)", tc.name, line["status"], tc.want)
+		}
+		if line["error"] == nil {
+			t.Errorf("%s: access line carries no error: %v", tc.name, line)
+		}
+		if _, counted := line["bytes"]; counted {
+			t.Errorf("%s: bytes logged before the error handler wrote the body: %v", tc.name, line)
 		}
 	}
 }
