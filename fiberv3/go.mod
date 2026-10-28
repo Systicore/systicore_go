@@ -4,7 +4,7 @@ go 1.26.0
 
 // Own module so the root stays framework-free and fiber v3's fasthttp pin
 // never leaks into chi / net/http consumers.
-require github.com/Systicore/systicore_go v0.1.0
+require github.com/Systicore/systicore_go v0.4.0
 
 require (
 	github.com/gofiber/fiber/v3 v3.5.0
